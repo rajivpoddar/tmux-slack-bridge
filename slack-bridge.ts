@@ -22,6 +22,7 @@
 import { App, type GenericMessageEvent } from "@slack/bolt";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
+import { writeFileSync } from "fs";
 
 // --- Configuration ---
 const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "D0ADL956AJH";
@@ -186,6 +187,52 @@ async function fetchFileContent(url: string): Promise<string | null> {
 }
 
 /**
+ * Download image files from Slack and save to /tmp.
+ * Returns array of local file paths for Claude Code to read with the Read tool.
+ */
+async function downloadImages(
+  message: GenericMessageEvent
+): Promise<string[]> {
+  const paths: string[] = [];
+
+  if (!message.files || message.files.length === 0) return paths;
+
+  for (const file of message.files) {
+    const mimetype = file.mimetype || "";
+    if (!mimetype.startsWith("image/")) continue;
+
+    const downloadUrl = file.url_private_download || file.url_private;
+    if (!downloadUrl) continue;
+
+    try {
+      const ext = file.filetype || mimetype.split("/")[1] || "png";
+      const safeName = (file.name || `image.${ext}`).replace(/[^a-zA-Z0-9._-]/g, "_");
+      const filename = `/tmp/slack-img-${Date.now()}-${safeName}`;
+
+      const response = await fetch(downloadUrl, {
+        headers: {
+          Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+        },
+      });
+
+      if (!response.ok) {
+        log(`⚠️ Failed to download image ${safeName}: ${response.status}`);
+        continue;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      writeFileSync(filename, buffer);
+      log(`📎 Saved image: ${filename} (${buffer.length} bytes)`);
+      paths.push(filename);
+    } catch (err: any) {
+      log(`⚠️ Image download error: ${err.message}`);
+    }
+  }
+
+  return paths;
+}
+
+/**
  * Send text to the target tmux pane via send-keys.
  * Uses -l (literal) to prevent tmux from interpreting special characters.
  */
@@ -238,7 +285,15 @@ app.message(async ({ message, client }) => {
     // 3. The actual message
     parts.push(text);
 
-    // 4. Snippets / file attachments
+    // 4. Image attachments — download to /tmp for Claude Code to read
+    const imagePaths = await downloadImages(msg);
+    if (imagePaths.length > 0) {
+      for (const path of imagePaths) {
+        parts.push(`[attached image: ${path}]`);
+      }
+    }
+
+    // 5. Snippets / file attachments
     const snippets = await getSnippets(client, msg);
     if (snippets.length > 0) {
       parts.push(...snippets);
