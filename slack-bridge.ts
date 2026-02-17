@@ -1,17 +1,19 @@
 /**
- * Slack DM Bridge — Two-way relay between Slack DMs and Claude Code PM pane.
+ * tmux-slack-bridge — Two-way relay between Slack DMs and a tmux pane.
  *
  * Connects via Slack Socket Mode (WebSocket) and forwards incoming DM messages
- * to the PM's tmux pane (0:0.0) via `tmux send-keys`. Claude Code processes the
- * message naturally and replies via its Slack MCP tools.
+ * to a configurable tmux pane via `tmux send-keys`. The target pane (e.g. Claude
+ * Code PM session) processes the message and replies via its own Slack tools.
  *
  * Features:
  * - Adds user name and timestamp to every forwarded message
  * - Quotes the last thread message when replying in a thread
- * - Includes code snippets/file attachments in the forwarded message
+ * - Includes code snippets and file attachments
+ * - Configurable tmux target (window:pane address)
  *
  * Usage:
- *   SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-... npm start
+ *   cp .env.example .env  # Fill in tokens
+ *   npm start
  *
  * Or via the wrapper:
  *   ./slack-bridge.sh start
@@ -22,8 +24,30 @@ import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 
 // --- Configuration ---
-const PM_CHANNEL = process.env.PM_CHANNEL || "D0ADL956AJH"; // Rajiv's DM channel
-const PM_PANE = process.env.PM_PANE || "0:0.0"; // PM tmux pane
+const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "D0ADL956AJH";
+const TMUX_TARGET = process.env.TMUX_TARGET || "0:0.0";
+
+// --- Preflight checks ---
+function checkTmux(): boolean {
+  try {
+    execSync("tmux list-sessions", { timeout: 3000, stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function checkPane(target: string): boolean {
+  try {
+    execSync(`tmux display-message -t ${target} -p "#S:#I.#P"`, {
+      timeout: 3000,
+      stdio: "pipe",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // --- Slack App ---
 const app = new App({
@@ -52,7 +76,10 @@ function formatTimestamp(ts: string): string {
 /**
  * Resolve a Slack user ID to their display name.
  */
-async function getUserName(client: WebClient, userId: string): Promise<string> {
+async function getUserName(
+  client: WebClient,
+  userId: string
+): Promise<string> {
   try {
     const result = await client.users.info({ user: userId });
     return (
@@ -84,7 +111,6 @@ async function getThreadContext(
     });
 
     const messages = result.messages || [];
-    // Find the message just before the current one in the thread
     let lastMessage: string | null = null;
     for (const msg of messages) {
       if (msg.ts === currentTs) break;
@@ -110,7 +136,6 @@ async function getSnippets(
   if (!message.files || message.files.length === 0) return snippets;
 
   for (const file of message.files) {
-    // Code snippets and text files
     if (
       file.filetype === "text" ||
       file.filetype === "javascript" ||
@@ -123,15 +148,18 @@ async function getSnippets(
       file.filetype === "post" ||
       file.mode === "snippet"
     ) {
-      // Try to get content from preview or download
       const content =
         file.preview ||
         file.plain_text ||
-        (file.url_private ? await fetchFileContent(client, file.url_private) : null);
+        (file.url_private
+          ? await fetchFileContent(file.url_private)
+          : null);
 
       if (content) {
         const label = file.title || file.name || `snippet.${file.filetype}`;
-        snippets.push(`[file: ${label}]\n\`\`\`\n${content.slice(0, 2000)}\n\`\`\``);
+        snippets.push(
+          `[file: ${label}]\n\`\`\`\n${content.slice(0, 2000)}\n\`\`\``
+        );
       }
     }
   }
@@ -142,10 +170,7 @@ async function getSnippets(
 /**
  * Download file content from Slack (authenticated).
  */
-async function fetchFileContent(
-  client: WebClient,
-  url: string
-): Promise<string | null> {
+async function fetchFileContent(url: string): Promise<string | null> {
   try {
     const response = await fetch(url, {
       headers: {
@@ -154,31 +179,30 @@ async function fetchFileContent(
     });
     if (!response.ok) return null;
     const text = await response.text();
-    return text.slice(0, 2000); // Cap at 2KB
+    return text.slice(0, 2000);
   } catch {
     return null;
   }
 }
 
 /**
- * Send text to the PM tmux pane via send-keys.
+ * Send text to the target tmux pane via send-keys.
  * Uses -l (literal) to prevent tmux from interpreting special characters.
  */
 function sendToPane(text: string) {
   const escaped = shellEscape(text);
   execSync(
-    `tmux send-keys -t ${PM_PANE} -l ${escaped} && sleep 0.3 && tmux send-keys -t ${PM_PANE} Enter`,
+    `tmux send-keys -t ${TMUX_TARGET} -l ${escaped} && sleep 0.3 && tmux send-keys -t ${TMUX_TARGET} Enter`,
     { timeout: 5000 }
   );
 }
 
 // --- Message Handler ---
 app.message(async ({ message, client }) => {
-  // Only process text messages in the PM's DM channel
   const msg = message as GenericMessageEvent;
   if (!msg.text && !msg.files) return;
-  if (msg.channel !== PM_CHANNEL) return;
-  if ("bot_id" in msg && msg.bot_id) return; // Skip bot's own messages
+  if (msg.channel !== SLACK_CHANNEL) return;
+  if ("bot_id" in msg && msg.bot_id) return;
 
   const text = msg.text || "";
   const userName = await getUserName(client, msg.user);
@@ -187,13 +211,14 @@ app.message(async ({ message, client }) => {
   log(`📩 Received from ${userName} at ${time}: ${text}`);
 
   try {
-    // Build the forwarded message
     const parts: string[] = [];
 
     // 1. Header with user and timestamp
-    parts.push(`[slack] message from ${userName} at ${time}. reply back on slack dm.`);
+    parts.push(
+      `[slack] message from ${userName} at ${time}. reply back on slack dm.`
+    );
 
-    // 2. Thread context — quote last message if this is a threaded reply
+    // 2. Thread context — quote last message if threaded reply
     if (msg.thread_ts && msg.thread_ts !== msg.ts) {
       const lastThreadMsg = await getThreadContext(
         client,
@@ -202,10 +227,10 @@ app.message(async ({ message, client }) => {
         msg.ts
       );
       if (lastThreadMsg) {
-        // Truncate long quotes
-        const quoted = lastThreadMsg.length > 200
-          ? lastThreadMsg.slice(0, 200) + "..."
-          : lastThreadMsg;
+        const quoted =
+          lastThreadMsg.length > 200
+            ? lastThreadMsg.slice(0, 200) + "..."
+            : lastThreadMsg;
         parts.push(`> ${quoted.replace(/\n/g, "\n> ")}`);
       }
     }
@@ -221,7 +246,7 @@ app.message(async ({ message, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
     sendToPane(fullMessage);
-    log(`✅ Forwarded to PM pane ${PM_PANE}`);
+    log(`✅ Forwarded to ${TMUX_TARGET}`);
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
   }
@@ -241,8 +266,20 @@ process.on("SIGTERM", async () => {
 });
 
 (async () => {
+  // Preflight: check tmux is running and target pane exists
+  if (!checkTmux()) {
+    console.error("❌ tmux is not running. Start a tmux session first.");
+    process.exit(1);
+  }
+  if (!checkPane(TMUX_TARGET)) {
+    console.error(
+      `❌ tmux pane ${TMUX_TARGET} not found. Check TMUX_TARGET in .env`
+    );
+    process.exit(1);
+  }
+
   await app.start();
-  log("🔗 Slack DM bridge running");
-  log(`   Channel: ${PM_CHANNEL}`);
-  log(`   PM Pane: ${PM_PANE}`);
+  log("🔗 tmux-slack-bridge running");
+  log(`   Slack channel: ${SLACK_CHANNEL}`);
+  log(`   tmux target:   ${TMUX_TARGET}`);
 })();

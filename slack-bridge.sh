@@ -1,5 +1,5 @@
 #!/bin/bash
-# Slack DM Bridge — start/stop/status daemon wrapper.
+# tmux-slack-bridge — start/stop/status daemon wrapper.
 #
 # Usage:
 #   ./slack-bridge.sh start   # Start bridge in background
@@ -28,6 +28,12 @@ fi
 start() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "⚠️  Bridge already running (PID $(cat "$PID_FILE"))"
+    return 1
+  fi
+
+  # Check tmux is running
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    echo "❌ tmux is not running. Start a tmux session first."
     return 1
   fi
 
