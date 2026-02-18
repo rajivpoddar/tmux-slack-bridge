@@ -261,11 +261,13 @@ app.message(async ({ message, client }) => {
     const parts: string[] = [];
 
     // 1. Header with user and timestamp — all context in one bracket
-    // Include thread_ts when this is a threaded reply so the PM can reply in-thread
+    // Always include thread_ts so PM can reply in-thread for any message.
+    // For top-level messages, thread_ts = msg.ts (the message's own ts becomes the thread anchor).
+    // For threaded replies, thread_ts = msg.thread_ts (the parent message ts).
     const isThreaded = !!(msg.thread_ts && msg.thread_ts !== msg.ts);
-    const threadPart = isThreaded ? ` | thread_ts=${msg.thread_ts}` : "";
+    const threadTs = isThreaded ? msg.thread_ts : msg.ts;
     parts.push(
-      `[slack | ${userName} | ${time} | reply via slack-dm skill${threadPart}]`
+      `[slack | ${userName} | ${time} | reply via slack-dm skill | thread_ts=${threadTs}]`
     );
 
     // 2. Thread context — quote last message if threaded reply
