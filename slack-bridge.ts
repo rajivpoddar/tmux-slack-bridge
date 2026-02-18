@@ -260,9 +260,9 @@ app.message(async ({ message, client }) => {
   try {
     const parts: string[] = [];
 
-    // 1. Header with user and timestamp
+    // 1. Header with user and timestamp — all context in one bracket
     parts.push(
-      `[slack] message from ${userName} at ${time}. reply back on slack dm.`
+      `[slack | ${userName} | ${time} | reply in DM, format as Slack markdown]`
     );
 
     // 2. Thread context — quote last message if threaded reply
