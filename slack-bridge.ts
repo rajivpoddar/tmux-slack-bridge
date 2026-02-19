@@ -25,7 +25,7 @@ import { execSync } from "child_process";
 import { writeFileSync } from "fs";
 
 // --- Configuration ---
-const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "D0ADL956AJH";
+const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "";  // Set SLACK_CHANNEL in .env
 const TMUX_TARGET = process.env.TMUX_TARGET || "0:0.0";
 
 // --- Preflight checks ---
