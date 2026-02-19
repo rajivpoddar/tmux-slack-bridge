@@ -267,7 +267,7 @@ app.message(async ({ message, client }) => {
     const isThreaded = !!(msg.thread_ts && msg.thread_ts !== msg.ts);
     const threadTs = isThreaded ? msg.thread_ts : msg.ts;
     parts.push(
-      `[slack | ${userName} | ${time} | reply via slack-dm skill | thread_ts=${threadTs}]`
+      `# slack-dm in thread ${threadTs} | ${userName} | ${time}`
     );
 
     // 2. Thread context — quote last message if threaded reply
