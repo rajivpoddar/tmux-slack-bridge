@@ -306,10 +306,10 @@ app.message(async ({ message, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    // Write pending-reply context so the PM pane Stop hook can auto-relay
-    // the response back to Slack if PM doesn't reply via MCP.
+    // Write last-inject context — channel + thread_ts of the forwarded message.
+    // Any Stop hook subscriber (e.g. MoP pm-reply-to-slack) can read this.
     writeFileSync(
-      "/tmp/slack-pending-reply.json",
+      "/tmp/slack-bridge-last-inject.json",
       JSON.stringify({ channel: msg.channel, thread_ts: threadTs })
     );
 
