@@ -1,58 +1,66 @@
 #!/bin/bash
-# setup.sh — Install the pm-reply-to-slack Stop hook into a Claude Code project.
+# setup.sh — Install/uninstall the pm-reply-to-slack Stop hook.
 #
-# Adds a Stop hook to the target project's .claude/settings.json that auto-relays
-# PM pane responses back to Slack when Claude doesn't reply via MCP directly.
-#
-# The hook script lives in the MoP plugin:
-#   ~/.claude/plugins/cache/rajiv-plugins/master-of-panes/1.0.0/scripts/pm-reply-to-slack.sh
+# Auto-detects the target project from TMUX_TARGET in .env:
+# reads the pane's current path via tmux, then installs the hook
+# into that project's .claude/settings.json.
 #
 # Usage:
-#   ./setup.sh /path/to/project                 # Install into a project
-#   ./setup.sh --uninstall /path/to/project     # Remove the Stop hook
+#   ./setup.sh              # Install (auto-detects project from TMUX_TARGET)
+#   ./setup.sh --uninstall  # Remove the Stop hook
 #
-# Prerequisites: jq, master-of-panes plugin installed
+# Prerequisites: jq, tmux running with target pane active
 
 set -euo pipefail
 
-MOP_HOOK="$HOME/.claude/plugins/cache/rajiv-plugins/master-of-panes/1.0.0/scripts/pm-reply-to-slack.sh"
-HOOK_CMD="bash $MOP_HOOK"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HOOK_SCRIPT="$SCRIPT_DIR/scripts/pm-reply-to-slack.sh"
+HOOK_CMD="bash $HOOK_SCRIPT"
 
 UNINSTALL=false
-TARGET=""
-
 for arg in "$@"; do
-  case "$arg" in
-    --uninstall) UNINSTALL=true ;;
-    *) TARGET="$arg" ;;
-  esac
+  [ "$arg" = "--uninstall" ] && UNINSTALL=true
 done
 
-if [ -z "$TARGET" ]; then
-  echo "Usage: ./setup.sh /path/to/project" >&2
-  echo "       ./setup.sh --uninstall /path/to/project" >&2
-  exit 1
-fi
-
-SETTINGS="$TARGET/.claude/settings.json"
-
-if [ ! -d "$TARGET" ]; then
-  echo "ERROR: Project directory not found: $TARGET" >&2
-  exit 1
-fi
-
+# --- Preflight ---
 if ! command -v jq &>/dev/null; then
   echo "ERROR: jq is required (brew install jq)" >&2
   exit 1
 fi
 
-if [ ! -f "$MOP_HOOK" ] && [ "$UNINSTALL" = "false" ]; then
-  echo "ERROR: MoP hook not found: $MOP_HOOK" >&2
-  echo "Install the master-of-panes plugin first." >&2
+if ! command -v tmux &>/dev/null; then
+  echo "ERROR: tmux is required" >&2
   exit 1
 fi
 
-mkdir -p "$TARGET/.claude"
+# --- Load TMUX_TARGET from .env ---
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ERROR: .env not found at $ENV_FILE" >&2
+  exit 1
+fi
+
+TMUX_TARGET=$(grep "^TMUX_TARGET=" "$ENV_FILE" | cut -d= -f2- | tr -d '"' | tr -d "'")
+if [ -z "$TMUX_TARGET" ]; then
+  echo "ERROR: TMUX_TARGET not set in .env" >&2
+  exit 1
+fi
+
+# --- Detect project from pane's current path ---
+PANE_PATH=$(tmux display-message -t "$TMUX_TARGET" -p '#{pane_current_path}' 2>/dev/null || true)
+if [ -z "$PANE_PATH" ]; then
+  echo "ERROR: Could not get path from pane $TMUX_TARGET — is tmux running?" >&2
+  exit 1
+fi
+
+SETTINGS="$PANE_PATH/.claude/settings.json"
+
+echo "Target pane:  $TMUX_TARGET"
+echo "Project path: $PANE_PATH"
+echo "Settings:     $SETTINGS"
+
+# --- Install or uninstall ---
+mkdir -p "$PANE_PATH/.claude"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -68,13 +76,17 @@ if [ "$UNINSTALL" = "true" ]; then
   jq 'del(.hooks.Stop)' "$SETTINGS" > "$TMP"
   if jq . "$TMP" > /dev/null 2>&1; then
     mv "$TMP" "$SETTINGS"
-    echo "✅ Stop hook removed from $SETTINGS"
+    echo "✅ Stop hook removed"
   else
     rm -f "$TMP"
     echo "ERROR: Failed to update settings.json" >&2
     exit 1
   fi
 else
+  if [ ! -f "$HOOK_SCRIPT" ]; then
+    echo "ERROR: Hook script not found: $HOOK_SCRIPT" >&2
+    exit 1
+  fi
   jq --arg cmd "$HOOK_CMD" '
     .hooks.Stop = [{
       "hooks": [{
@@ -88,9 +100,7 @@ else
   if jq . "$TMP" > /dev/null 2>&1; then
     mv "$TMP" "$SETTINGS"
     echo "✅ Stop hook installed"
-    echo "   Project:  $TARGET"
-    echo "   Settings: $SETTINGS"
-    echo "   Command:  $HOOK_CMD"
+    echo "   Command: $HOOK_CMD"
     echo ""
     echo "Restart Claude Code in the project to activate the hook."
   else
