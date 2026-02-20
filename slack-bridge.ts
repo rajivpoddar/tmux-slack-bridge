@@ -305,6 +305,14 @@ app.message(async ({ message, client }) => {
     }
 
     const fullMessage = parts.filter(Boolean).join("\n");
+
+    // Write pending-reply context so the PM pane Stop hook can auto-relay
+    // the response back to Slack if PM doesn't reply via MCP.
+    writeFileSync(
+      "/tmp/slack-pending-reply.json",
+      JSON.stringify({ channel: msg.channel, thread_ts: threadTs })
+    );
+
     sendToPane(fullMessage);
     log(`✅ Forwarded to ${TMUX_TARGET}`);
   } catch (err: any) {
