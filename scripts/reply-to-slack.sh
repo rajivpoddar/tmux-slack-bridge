@@ -105,11 +105,23 @@ for line in lines:
 if not last_text.strip():
     sys.exit(1)
 
+# Convert markdown → Slack mrkdwn using the shared converter script
+import subprocess
+_converter = os.path.expanduser('~/.claude/skills/slack-markdown/scripts/md-to-mrkdwn.py')
+try:
+    _result = subprocess.run(
+        ['python3', _converter],
+        input=last_text, capture_output=True, text=True, timeout=5
+    )
+    converted_text = _result.stdout if _result.returncode == 0 else last_text
+except Exception:
+    converted_text = last_text
+
 # Output JSON payload for curl
 payload = {
     'channel': channel,
     'thread_ts': thread_ts,
-    'text': last_text[:3000],
+    'text': converted_text[:3000],
 }
 print(json.dumps(payload))
 PYEOF
