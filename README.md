@@ -16,12 +16,25 @@ Claude Code PM pane → Stop hook → reply-to-slack.sh → Slack DM thread
 3. Claude Code processes the message
 4. When Claude Code finishes responding, the `Stop` hook captures the last reply and posts it back to your Slack thread
 
+## Designed for Master of Panes
+
+This bridge is designed to work alongside the [Master of Panes](https://github.com/rajivpoddar/master-of-panes) Claude Code plugin. MoP orchestrates parallel dev sessions across tmux panes; the bridge lets you remotely command the PM pane from Slack while away from the terminal.
+
+**Typical setup:**
+- MoP manages 1 PM pane + 4 dev panes
+- The bridge points at the PM pane (`TMUX_TARGET=0:0.0`)
+- You DM the bot from your phone → MoP's PM session receives and acts
+- The Stop hook replies to your Slack thread automatically
+
+The bridge works standalone too — it just forwards Slack DMs to any tmux pane.
+
 ## Prerequisites
 
 - **tmux** running with a Claude Code session in the target pane
 - **Node.js** 18+ (for running the bridge)
 - **Slack App** with Socket Mode enabled (see setup below)
 - **Slack MCP server** configured in Claude Code (required for Claude Code to send messages back independently — see note below)
+- **Master of Panes** plugin (recommended) — [github.com/rajivpoddar/master-of-panes](https://github.com/rajivpoddar/master-of-panes)
 
 ## Slack App Setup
 
