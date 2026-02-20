@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOOK_SCRIPT="$SCRIPT_DIR/scripts/pm-reply-to-slack.sh"
+HOOK_SCRIPT="$SCRIPT_DIR/scripts/reply-to-slack.sh"
 HOOK_CMD="bash $HOOK_SCRIPT"
 
 UNINSTALL=false
