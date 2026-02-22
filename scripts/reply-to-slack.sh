@@ -48,9 +48,23 @@ import json, sys, os
 
 PENDING_FILE = '/tmp/slack-bridge-last-inject.json'
 
-# Load pending context
+# Load pending context from FIFO queue (pop oldest entry)
 try:
-    ctx = json.load(open(PENDING_FILE))
+    raw = json.load(open(PENDING_FILE))
+    # Support both old format (single object) and new format (array queue)
+    if isinstance(raw, list):
+        if len(raw) == 0:
+            os.remove(PENDING_FILE)
+            sys.exit(1)
+        ctx = raw.pop(0)  # Pop oldest
+        # Write remaining queue back (or delete if empty)
+        if raw:
+            with open(PENDING_FILE, 'w') as f:
+                json.dump(raw, f)
+        else:
+            os.remove(PENDING_FILE)
+    else:
+        ctx = raw  # Legacy single-object format
     channel = ctx.get('channel', '')
     thread_ts = ctx.get('thread_ts', '')
     if not channel or not thread_ts:
@@ -134,7 +148,8 @@ EXIT_CODE=$?
 # If we got a payload (non-empty CURL_PAYLOAD), post it
 
 if [ $EXIT_CODE -ne 0 ] || [ -z "$CURL_PAYLOAD" ]; then
-  rm -f "$PENDING_FILE"
+  # Queue was already updated by Python (popped entry + wrote remaining)
+  # Only clean up if Python exited with error (didn't get to pop)
   exit 0
 fi
 
@@ -146,7 +161,7 @@ if [ -f "$BRIDGE_ENV" ]; then
 fi
 
 if [ -z "$SLACK_TOKEN" ]; then
-  rm -f "$PENDING_FILE"
+  # No token — can't post. Queue entry already popped by Python.
   exit 0
 fi
 
@@ -156,5 +171,5 @@ curl -s -X POST https://slack.com/api/chat.postMessage \
   -H "Content-Type: application/json" \
   -d "$CURL_PAYLOAD" > /dev/null 2>&1
 
-rm -f "$PENDING_FILE"
+# Queue was already updated by Python (popped entry, wrote remaining or deleted file)
 exit 0

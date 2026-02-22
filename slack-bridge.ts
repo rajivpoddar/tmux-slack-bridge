@@ -22,7 +22,7 @@
 import { App, type GenericMessageEvent } from "@slack/bolt";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
-import { writeFileSync } from "fs";
+import { writeFileSync, readFileSync, existsSync } from "fs";
 
 // --- Configuration ---
 const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "";  // Set SLACK_CHANNEL in .env
@@ -306,12 +306,15 @@ app.message(async ({ message, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    // Write last-inject context — channel + thread_ts of the forwarded message.
-    // Any Stop hook subscriber (e.g. MoP pm-reply-to-slack) can read this.
-    writeFileSync(
-      "/tmp/slack-bridge-last-inject.json",
-      JSON.stringify({ channel: msg.channel, thread_ts: threadTs })
-    );
+    // Append to inject queue — channel + thread_ts of the forwarded message.
+    // Uses a FIFO queue (array) so multiple rapid messages don't overwrite each other.
+    // The Stop hook (reply-to-slack.sh) pops the oldest entry when replying.
+    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
+    const queue = existsSync(QUEUE_FILE)
+      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
+      : [];
+    queue.push({ channel: msg.channel, thread_ts: threadTs });
+    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
 
     sendToPane(fullMessage);
     log(`✅ Forwarded to ${TMUX_TARGET}`);
