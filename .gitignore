@@ -2,3 +2,9 @@ node_modules/
 .env
 /tmp/
 *.log
+
+# Secrets and runtime data
+.env
+bridge.db
+bridge.db-shm
+bridge.db-wal

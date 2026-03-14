@@ -88,15 +88,24 @@ try:
 except Exception:
     sys.exit(1)
 
-# Check if this turn already called Slack conversations_add_message
+# Check if this turn already replied to Slack via ANY mechanism:
+# 1. MCP conversations_add_message tool call
+# 2. Bash tool call containing curl chat.postMessage (direct API posts)
 # Scan last 50 lines (one full turn with tool calls)
 for line in lines[-50:]:
     try:
         obj = json.loads(line.strip())
         for block in obj.get('message', {}).get('content', []):
-            if (block.get('type') == 'tool_use' and
-                    'add_message' in block.get('name', '')):
-                sys.exit(0)  # Already replied — no auto-post needed
+            if block.get('type') == 'tool_use':
+                tool_name = block.get('name', '')
+                # MCP Slack tool
+                if 'add_message' in tool_name or 'send_message' in tool_name:
+                    sys.exit(0)  # Already replied via MCP
+                # Direct curl to Slack API via Bash tool
+                if tool_name == 'Bash':
+                    cmd = block.get('input', {}).get('command', '')
+                    if 'chat.postMessage' in cmd and thread_ts in cmd:
+                        sys.exit(0)  # Already replied via curl
     except Exception:
         pass
 

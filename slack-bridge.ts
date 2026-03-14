@@ -1,7 +1,8 @@
 /**
- * tmux-slack-bridge — Two-way relay between Slack DMs and a tmux pane.
+ * tmux-slack-bridge — Two-way relay between Slack and a tmux pane.
  *
- * Connects via Slack Socket Mode (WebSocket) and forwards incoming DM messages
+ * Connects via Slack Socket Mode (WebSocket) and forwards incoming messages
+ * from configured channels (DMs, public/private channels) and @mentions
  * to a configurable tmux pane via `tmux send-keys`. The target pane (e.g. Claude
  * Code PM session) processes the message and replies via its own Slack tools.
  *
@@ -22,11 +23,25 @@
 import { App, type GenericMessageEvent } from "@slack/bolt";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
-import { writeFileSync, readFileSync, existsSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
+import { recordMessage, closeDb } from "./db.ts";
+
+// Channel log file — shared read-only feed for all slots
+const CHANNEL_LOG_FILE = "/tmp/heydonna-dev-channel.log";
+const HEYDONNA_DEV_CHANNEL = "C0ALZJHGE49";
 
 // --- Configuration ---
-const SLACK_CHANNEL = process.env.SLACK_CHANNEL || "";  // Set SLACK_CHANNEL in .env
+// SLACK_CHANNEL supports comma-separated list: "D0ADL956AJH,C0AGWPQFKHA"
+const SLACK_CHANNELS = new Set(
+  (process.env.SLACK_CHANNEL || "").split(",").map((s) => s.trim()).filter(Boolean)
+);
 const TMUX_TARGET = process.env.TMUX_TARGET || "0:0.0";
+
+// Channels where bot messages are allowed through (e.g. #heydonna-alerts)
+// All other channels still filter out bot messages to prevent forwarding loops.
+const BOT_ALLOWED_CHANNELS = new Set(
+  (process.env.SLACK_BOT_ALLOWED_CHANNELS || "").split(",").map((s) => s.trim()).filter(Boolean)
+);
 
 // --- Preflight checks ---
 function checkTmux(): boolean {
@@ -244,14 +259,49 @@ function sendToPane(text: string) {
   );
 }
 
+// Our bot user ID — used to distinguish our @mentions from other bots' @mentions
+const OUR_BOT_USER_ID = "U0ALEAYCAUT";
+
+// MoP routing endpoint (for @mention-based per-slot routing)
+const MOP_ROUTE_URL = process.env.MOP_ROUTE_URL || "http://localhost:3100/api/slack-route";
+
+/**
+ * Route a message via MoP for @mention-based per-slot delivery.
+ * Falls back to direct tmux send if MoP is unavailable.
+ */
+async function routeViaMoP(rawText: string, formatted: string, channel: string): Promise<boolean> {
+  try {
+    const resp = await fetch(MOP_ROUTE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: rawText, formatted, channel }),
+    });
+    if (resp.ok) {
+      const result = await resp.json() as { routed?: string[]; targets?: string[] };
+      log(`🔀 MoP routed to ${(result.targets || []).join(", ")}`);
+      return true;
+    }
+    log(`⚠️ MoP route failed: ${resp.status}`);
+    return false;
+  } catch {
+    log(`⚠️ MoP unreachable — falling back to direct tmux`);
+    return false;
+  }
+}
+
 // --- Message Handler ---
 app.message(async ({ message, client }) => {
   const msg = message as GenericMessageEvent;
   if (!msg.text && !msg.files) return;
-  if (msg.channel !== SLACK_CHANNEL) return;
-  if ("bot_id" in msg && msg.bot_id) return;
+  if (!SLACK_CHANNELS.has(msg.channel)) return;
+  if ("bot_id" in msg && msg.bot_id && !BOT_ALLOWED_CHANNELS.has(msg.channel)) return;
 
   const text = msg.text || "";
+
+  // Note: Previously filtered messages @mentioning non-bot users (lines 266-269).
+  // Removed because it dropped ALL messages with @mentions (including human users
+  // like @Abilaasha, @Rajiv), not just bot mentions. The SLACK_CHANNELS filter
+  // on line 258 already limits which channels are forwarded — no secondary filter needed.
   const userName = await getUserName(client, msg.user);
   const time = formatTimestamp(msg.ts);
 
@@ -266,8 +316,11 @@ app.message(async ({ message, client }) => {
     // For threaded replies, thread_ts = msg.thread_ts (the parent message ts).
     const isThreaded = !!(msg.thread_ts && msg.thread_ts !== msg.ts);
     const threadTs = isThreaded ? msg.thread_ts : msg.ts;
+    // Use "slack-dm" for DMs, "slack-channel" for public/private channels
+    const isDM = msg.channel.startsWith("D");
+    const prefix = isDM ? "slack-dm" : `slack-channel ${msg.channel}`;
     parts.push(
-      `# slack-dm in thread ${threadTs} | ${userName} | ${time}`
+      `# ${prefix} in thread ${threadTs} | ${userName} | ${time}`
     );
 
     // 2. Thread context — quote last message if threaded reply
@@ -316,8 +369,105 @@ app.message(async ({ message, client }) => {
     queue.push({ channel: msg.channel, thread_ts: threadTs });
     writeFileSync(QUEUE_FILE, JSON.stringify(queue));
 
+    // Record in SQLite
+    try {
+      recordMessage({
+        ts: msg.ts,
+        threadTs: isThreaded ? msg.thread_ts! : null,
+        channelId: msg.channel,
+        channelType: isDM ? "dm" : "channel",
+        userId: msg.user,
+        userName,
+        body: text,
+        hasImages: imagePaths.length > 0,
+        hasSnippets: snippets.length > 0,
+      });
+    } catch (dbErr: any) {
+      log(`⚠️ DB record error: ${dbErr.message}`);
+    }
+
+    // Append to shared channel log file (slots can read anytime)
+    if (msg.channel === HEYDONNA_DEV_CHANNEL) {
+      try {
+        const logLine = `[${time}] ${userName}: ${text}\n`;
+        appendFileSync(CHANNEL_LOG_FILE, logLine);
+      } catch {}
+    }
+
+    // Route via MoP for @mention-based per-slot delivery
+    // For channel messages with @mentions, MoP routes to the mentioned slot(s)
+    // For DMs or messages without slot mentions, sends directly to PM pane
+    const hasSlotMentions = !isDM && /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text);
+    if (hasSlotMentions) {
+      const routed = await routeViaMoP(text, fullMessage, msg.channel);
+      if (!routed) {
+        // Fallback: send to PM pane directly
+        sendToPane(fullMessage);
+        log(`✅ Forwarded to ${TMUX_TARGET} (MoP fallback)`);
+      }
+    } else {
+      sendToPane(fullMessage);
+      log(`✅ Forwarded to ${TMUX_TARGET}`);
+    }
+  } catch (err: any) {
+    log(`❌ tmux error: ${err.message}`);
+  }
+});
+
+// --- @mention Handler ---
+// Handles @HeyDonna PM mentions in any channel the bot is a member of.
+// Unlike the message handler, this fires on app_mention events regardless of SLACK_CHANNELS.
+app.event("app_mention", async ({ event, client }) => {
+  // Skip if already handled by the message handler (DM channels)
+  if (SLACK_CHANNELS.has(event.channel)) return;
+
+  const text = event.text || "";
+  const userName = await getUserName(client, event.user);
+  const time = formatTimestamp(event.ts);
+
+  log(`📩 @mention from ${userName} at ${time} in ${event.channel}: ${text}`);
+
+  try {
+    const parts: string[] = [];
+
+    const isThreaded = !!(event.thread_ts && event.thread_ts !== event.ts);
+    const threadTs = isThreaded ? event.thread_ts : event.ts;
+    parts.push(
+      `# slack-mention in ${event.channel} thread ${threadTs} | ${userName} | ${time}`
+    );
+
+    // Strip the bot @mention from the text for cleaner forwarding
+    const cleanText = text.replace(/<@[A-Z0-9]+>/g, "").trim();
+    if (cleanText) parts.push(cleanText);
+
+    const fullMessage = parts.filter(Boolean).join("\n");
+
+    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
+    const queue = existsSync(QUEUE_FILE)
+      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
+      : [];
+    queue.push({ channel: event.channel, thread_ts: threadTs });
+    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
+
+    // Record in SQLite
+    try {
+      recordMessage({
+        ts: event.ts,
+        threadTs: isThreaded ? event.thread_ts! : null,
+        channelId: event.channel,
+        channelType: "mention",
+        userId: event.user,
+        userName,
+        body: cleanText,
+        hasImages: false,
+        hasSnippets: false,
+      });
+    } catch (dbErr: any) {
+      log(`⚠️ DB record error: ${dbErr.message}`);
+    }
+
     sendToPane(fullMessage);
-    log(`✅ Forwarded to ${TMUX_TARGET}`);
+    log(`✅ @mention forwarded to ${TMUX_TARGET}`);
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
   }
@@ -326,12 +476,14 @@ app.message(async ({ message, client }) => {
 // --- Lifecycle ---
 process.on("SIGINT", async () => {
   log("🛑 Shutting down...");
+  closeDb();
   await app.stop();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
   log("🛑 Shutting down (SIGTERM)...");
+  closeDb();
   await app.stop();
   process.exit(0);
 });
@@ -351,6 +503,8 @@ process.on("SIGTERM", async () => {
 
   await app.start();
   log("🔗 tmux-slack-bridge running");
-  log(`   Slack channel: ${SLACK_CHANNEL}`);
-  log(`   tmux target:   ${TMUX_TARGET}`);
+  log(`   Slack channels: ${[...SLACK_CHANNELS].join(", ")}`);
+  log(`   Bot-allowed:    ${BOT_ALLOWED_CHANNELS.size > 0 ? [...BOT_ALLOWED_CHANNELS].join(", ") : "(none)"}`);
+  log(`   @mentions:      enabled (any channel bot is in)`);
+  log(`   tmux target:    ${TMUX_TARGET}`);
 })();
