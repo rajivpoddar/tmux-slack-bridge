@@ -26,9 +26,11 @@ import { execSync } from "child_process";
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
 import { recordMessage, closeDb } from "./db.ts";
 
-// Channel log file — shared read-only feed for all slots
+// Channel log files — shared read-only feeds for all slots / PM
 const CHANNEL_LOG_FILE = "/tmp/heydonna-dev-channel.log";
 const HEYDONNA_DEV_CHANNEL = "C0ALZJHGE49";
+const FEEDBACK_LOG_FILE = "/tmp/heydonna-feedback-channel.log";
+const HEYDONNA_FEEDBACK_CHANNEL = "C0AGWPQFKHA";
 
 // --- Configuration ---
 // SLACK_CHANNEL supports comma-separated list: "D0ADL956AJH,C0AGWPQFKHA"
@@ -386,11 +388,17 @@ app.message(async ({ message, client }) => {
       log(`⚠️ DB record error: ${dbErr.message}`);
     }
 
-    // Append to shared channel log file (slots can read anytime)
+    // Append to shared channel log files (slots / PM can read anytime)
     if (msg.channel === HEYDONNA_DEV_CHANNEL) {
       try {
         const logLine = `[${time}] ${userName}: ${text}\n`;
         appendFileSync(CHANNEL_LOG_FILE, logLine);
+      } catch {}
+    } else if (msg.channel === HEYDONNA_FEEDBACK_CHANNEL) {
+      try {
+        const threadMarker = isThreaded ? ` (thread ${msg.thread_ts})` : "";
+        const logLine = `[${time}] ${userName}${threadMarker}: ${text}\n`;
+        appendFileSync(FEEDBACK_LOG_FILE, logLine);
       } catch {}
     }
 
