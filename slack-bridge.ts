@@ -24,7 +24,7 @@ import { App, type GenericMessageEvent } from "@slack/bolt";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
-import { recordMessage, closeDb } from "./db.ts";
+import { recordMessage, setThreadOwner, getThreadOwner, closeDb } from "./db.ts";
 
 // Channel log files — shared read-only feeds for all slots / PM
 const CHANNEL_LOG_FILE = "/tmp/heydonna-dev-channel.log";
@@ -68,10 +68,25 @@ function checkPane(target: string): boolean {
 }
 
 // --- Slack App ---
+// Our team bot user IDs — messages from these bots are "self" messages.
+// We allow them through (ignoreSelf: false) but only route to panes when
+// they contain @mentions or @channel (to enable PM broadcasting).
+const OWN_BOT_USER_IDS = new Set([
+  "U0ALEAYCAUT",  // Dhruva PM
+  "U0AMETSAHC0",  // Rohini SD
+  "U0ALE8Z8X2P",  // Hasta QA
+  "U0AMEUQ8DR6",  // Ashwini JD
+  "U0AMEUZPQ5N",  // Chitra QA
+]);
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN!,
   socketMode: true,
   appToken: process.env.SLACK_APP_TOKEN!,
+  // Allow our own bot's messages through — handler at line 321 filters
+  // self-messages that don't contain routable @mentions. Required for
+  // PM health check pings (Dhruva PM bot @mentioning slot bots).
+  ignoreSelf: false,
 });
 
 function log(msg: string) {
@@ -253,16 +268,67 @@ async function downloadImages(
  * Send text to the target tmux pane via send-keys.
  * Uses -l (literal) to prevent tmux from interpreting special characters.
  */
-function sendToPane(text: string) {
+function sendToPane(text: string, target?: string) {
+  const pane = target || TMUX_TARGET;
   const escaped = shellEscape(text);
   execSync(
-    `tmux send-keys -t ${TMUX_TARGET} -l ${escaped} && sleep 0.3 && tmux send-keys -t ${TMUX_TARGET} Enter`,
+    `tmux send-keys -t ${pane} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${pane} Enter`,
     { timeout: 5000 }
   );
 }
 
+/**
+ * PR-merge auto-cleanup (Option 2, Rajiv directive 2026-04-29 21:49):
+ * When a #heydonna-alerts message announces a PR merged to main, inject
+ * `/cleanup-pr <PR>` into the PM pane (0:0.0) ~2s after the alert lands.
+ *
+ * Detection: must contain BOTH `*PR #NNNN*` and the literal "merged to `main`".
+ * Idempotency: skip if /tmp/cleanup-pr-fired-<PR>.flag exists.
+ * Skip cases: closed-without-merge, draft-transitions, non-merge alerts.
+ */
+const PM_PANE = "0:0.0";
+const MERGE_ALERT_PR_RE = /\*PR #(\d+)\*/;
+const MERGE_ALERT_MERGED_RE = /merged to `main`/;
+
+function maybeInjectCleanupPr(rawText: string): void {
+  if (!MERGE_ALERT_MERGED_RE.test(rawText)) return;
+  const m = rawText.match(MERGE_ALERT_PR_RE);
+  if (!m) return;
+  const pr = m[1];
+  const flagFile = `/tmp/cleanup-pr-fired-${pr}.flag`;
+  if (existsSync(flagFile)) {
+    log(`🧹 cleanup-pr #${pr} already fired (flag exists) — skipping`);
+    return;
+  }
+  // Mark flag immediately so a duplicate alert in flight can't double-fire.
+  try { writeFileSync(flagFile, `${new Date().toISOString()}\n`); } catch {}
+  // Defer the inject so PM's UserPromptSubmit hook for the alert can complete first.
+  setTimeout(() => {
+    try {
+      const cmd = `/cleanup-pr ${pr}`;
+      const escaped = shellEscape(cmd);
+      execSync(
+        `tmux send-keys -t ${PM_PANE} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${PM_PANE} Enter`,
+        { timeout: 5000 }
+      );
+      log(`🧹 Injected /cleanup-pr ${pr} into ${PM_PANE}`);
+    } catch (err: any) {
+      log(`❌ cleanup-pr inject error for #${pr}: ${err.message}`);
+    }
+  }, 2000);
+}
+
 // Our bot user ID — used to distinguish our @mentions from other bots' @mentions
 const OUR_BOT_USER_ID = "U0ALEAYCAUT";
+
+// Bot user ID → tmux pane address mapping for thread ownership inference
+const BOT_TO_PANE: Record<string, string> = {
+  "U0ALEAYCAUT": "0:0.0",  // Dhruva PM
+  "U0AMETSAHC0": "0:0.1",  // Rohini SD (slot 1)
+  "U0ALE8Z8X2P": "0:0.2",  // Hasta QA (slot 2)
+  "U0AMEUQ8DR6": "0:0.3",  // Ashwini JD (slot 3)
+  "U0AMEUZPQ5N": "0:0.4",  // Chitra QA (slot 4)
+};
 
 // MoP routing endpoint (for @mention-based per-slot routing)
 const MOP_ROUTE_URL = process.env.MOP_ROUTE_URL || "http://localhost:3100/api/slack-route";
@@ -296,15 +362,41 @@ app.message(async ({ message, client }) => {
   const msg = message as GenericMessageEvent;
   if (!msg.text && !msg.files) return;
   if (!SLACK_CHANNELS.has(msg.channel)) return;
-  if ("bot_id" in msg && msg.bot_id && !BOT_ALLOWED_CHANNELS.has(msg.channel)) return;
 
   const text = msg.text || "";
+
+  // Self-message guard: prevent infinite forwarding loops.
+  // - PM bot (U0ALEAYCAUT) messages → only forward if they have @mentions (prevents PM→PM loop)
+  // - Slot bots (Rohini, Hasta, Ashwini, Chitra) → ALWAYS forward to PM
+  //   These are status updates, QA reports, etc. that the PM needs to see.
+  //   Rajiv directive (2026-03-22): "whenever a dev/qa posts on heydonna-dev channel,
+  //   the slack bridge should forward it to the PM"
+  // - Non-team bot messages → only forward in BOT_ALLOWED_CHANNELS
+  if ("bot_id" in msg && msg.bot_id) {
+    if (!BOT_ALLOWED_CHANNELS.has(msg.channel)) return;
+    const isPmBot = msg.user === "U0ALEAYCAUT";  // Dhruva PM
+    const isSlotBot = msg.user && OWN_BOT_USER_IDS.has(msg.user) && !isPmBot;
+    if (isPmBot) {
+      // PM bot → only forward if has @mentions or @channel (prevents PM→PM loop)
+      const hasRoutableContent = /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
+        || /<!channel>|<!here>/.test(text);
+      if (!hasRoutableContent) return;
+    }
+    // Slot bots → fall through (always forwarded to PM pane)
+  }
 
   // Note: Previously filtered messages @mentioning non-bot users (lines 266-269).
   // Removed because it dropped ALL messages with @mentions (including human users
   // like @Abilaasha, @Rajiv), not just bot mentions. The SLACK_CHANNELS filter
   // on line 258 already limits which channels are forwarded — no secondary filter needed.
-  const userName = await getUserName(client, msg.user);
+
+  // Bot/app messages (e.g., HeyDonna Alerts) have bot_id but no user field.
+  // Extract name from bot_profile or username, and use bot_id as userId fallback.
+  const isBotMessage = "bot_id" in msg && msg.bot_id && !msg.user;
+  const effectiveUserId = msg.user || (msg as any).bot_id || "unknown_bot";
+  const userName = isBotMessage
+    ? ((msg as any).bot_profile?.name || (msg as any).username || `bot:${(msg as any).bot_id}`)
+    : await getUserName(client, msg.user);
   const time = formatTimestamp(msg.ts);
 
   log(`📩 Received from ${userName} at ${time}: ${text}`);
@@ -371,14 +463,14 @@ app.message(async ({ message, client }) => {
     queue.push({ channel: msg.channel, thread_ts: threadTs });
     writeFileSync(QUEUE_FILE, JSON.stringify(queue));
 
-    // Record in SQLite
+    // Record in SQLite — use effectiveUserId for bot messages (bot_id fallback)
     try {
       recordMessage({
         ts: msg.ts,
         threadTs: isThreaded ? msg.thread_ts! : null,
         channelId: msg.channel,
         channelType: isDM ? "dm" : "channel",
-        userId: msg.user,
+        userId: effectiveUserId,
         userName,
         body: text,
         hasImages: imagePaths.length > 0,
@@ -405,20 +497,91 @@ app.message(async ({ message, client }) => {
     // Route via MoP for @mention-based per-slot delivery
     // For channel messages with @mentions, MoP routes to the mentioned slot(s)
     // For DMs or messages without slot mentions, sends directly to PM pane
-    const hasSlotMentions = !isDM && /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text);
+    const hasSlotMentions = !isDM && (/<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text) || /<!channel>|<!here>/.test(text));
     if (hasSlotMentions) {
       const routed = await routeViaMoP(text, fullMessage, msg.channel);
-      if (!routed) {
+      if (routed) {
+        // MoP routed successfully — record thread ownership for first slot mentioned
+        const slotMatch = text.match(/<@(U0(?:AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N))>/);
+        if (slotMatch && BOT_TO_PANE[slotMatch[1]]) {
+          setThreadOwner(msg.channel, threadTs!, BOT_TO_PANE[slotMatch[1]], slotMatch[1]);
+          log(`📌 Thread ${threadTs} owned by pane ${BOT_TO_PANE[slotMatch[1]]}`);
+        }
+      } else {
         // Fallback: send to PM pane directly
         sendToPane(fullMessage);
         log(`✅ Forwarded to ${TMUX_TARGET} (MoP fallback)`);
       }
     } else {
-      sendToPane(fullMessage);
-      log(`✅ Forwarded to ${TMUX_TARGET}`);
+      // Check thread ownership — route replies to the thread owner's pane
+      const threadOwnerPane = isThreaded && msg.thread_ts
+        ? getThreadOwner(msg.channel, msg.thread_ts)
+        : null;
+
+      if (threadOwnerPane && threadOwnerPane !== TMUX_TARGET) {
+        // Route to thread owner pane AND PM pane (PM always gets a copy)
+        sendToPane(fullMessage, threadOwnerPane);
+        sendToPane(fullMessage);
+        log(`✅ Forwarded to ${threadOwnerPane} (thread owner) + ${TMUX_TARGET} (PM copy)`);
+      } else {
+        sendToPane(fullMessage);
+        log(`✅ Forwarded to ${TMUX_TARGET}`);
+      }
     }
+
+    // PR-merge auto-cleanup REMOVED 2026-05-09 11:24 IST per Rajiv directive
+    // (thread `1778305952.306479`): the duplicate inject was redundant after
+    // pm-context-injector.sh's `[PR_MERGED_DETECTED]` system-reminder hook
+    // started firing on the same Slack alert. CP #13 + the hook drive PM to
+    // dispatch cleanup-pr bg-agent on the merge alert; the slack-bridge inject
+    // was a second trigger PM had to dedup manually. Function definition kept
+    // as dead code below for git-blame archaeology.
+    // maybeInjectCleanupPr(text);
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
+  }
+});
+
+// --- Self-Message Router ---
+// Bolt's app.message() silently drops the bot's own messages (no ignoreSelf override).
+// Use a raw 'message' event to catch our own bot messages that need @channel/@mention routing.
+app.event("message", async ({ event, client }) => {
+  const msg = event as any;
+  // Only handle messages from our own bots that Bolt's app.message() dropped
+  if (!("bot_id" in msg) || !msg.bot_id) return;
+  if (!msg.user || !OWN_BOT_USER_IDS.has(msg.user)) return;
+  if (!SLACK_CHANNELS.has(msg.channel)) return;
+
+  const text = msg.text || "";
+  // Only route if message has @mentions or @channel — prevents infinite loops
+  const hasRoutableContent = /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
+    || /<!channel>|<!here>/.test(text);
+  if (!hasRoutableContent) return;
+
+  log(`📩 [self-route] Own bot message with routing: ${text.slice(0, 100)}`);
+
+  // Record thread ownership — if a bot starts or replies in a thread, that bot's pane owns it
+  const threadTs = msg.thread_ts || msg.ts;
+  const botPane = BOT_TO_PANE[msg.user];
+  if (botPane) {
+    setThreadOwner(msg.channel, threadTs, botPane, msg.user);
+    log(`📌 [self-route] Thread ${threadTs} owned by ${botPane} (${msg.user})`);
+  }
+
+  // Route via MoP for @mention-based delivery
+  const userName = await getUserName(client, msg.user);
+  const time = formatTimestamp(msg.ts);
+  const fullMessage = `# slack-channel ${msg.channel} in thread ${threadTs} | ${userName} | ${time}\n${text}`;
+
+  try {
+    const routed = await routeViaMoP(text, fullMessage, msg.channel);
+    if (routed) {
+      log(`✅ [self-route] Routed via MoP`);
+    } else {
+      log(`⚠️ [self-route] MoP routing failed — skipping (self-messages don't go to PM pane)`);
+    }
+  } catch (err: any) {
+    log(`❌ [self-route] Error: ${err.message}`);
   }
 });
 
