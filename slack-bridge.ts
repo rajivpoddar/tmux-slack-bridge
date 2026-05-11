@@ -277,46 +277,15 @@ function sendToPane(text: string, target?: string) {
   );
 }
 
-/**
- * PR-merge auto-cleanup (Option 2, Rajiv directive 2026-04-29 21:49):
- * When a #heydonna-alerts message announces a PR merged to main, inject
- * `/cleanup-pr <PR>` into the PM pane (0:0.0) ~2s after the alert lands.
- *
- * Detection: must contain BOTH `*PR #NNNN*` and the literal "merged to `main`".
- * Idempotency: skip if /tmp/cleanup-pr-fired-<PR>.flag exists.
- * Skip cases: closed-without-merge, draft-transitions, non-merge alerts.
- */
-const PM_PANE = "0:0.0";
-const MERGE_ALERT_PR_RE = /\*PR #(\d+)\*/;
-const MERGE_ALERT_MERGED_RE = /merged to `main`/;
-
-function maybeInjectCleanupPr(rawText: string): void {
-  if (!MERGE_ALERT_MERGED_RE.test(rawText)) return;
-  const m = rawText.match(MERGE_ALERT_PR_RE);
-  if (!m) return;
-  const pr = m[1];
-  const flagFile = `/tmp/cleanup-pr-fired-${pr}.flag`;
-  if (existsSync(flagFile)) {
-    log(`🧹 cleanup-pr #${pr} already fired (flag exists) — skipping`);
-    return;
-  }
-  // Mark flag immediately so a duplicate alert in flight can't double-fire.
-  try { writeFileSync(flagFile, `${new Date().toISOString()}\n`); } catch {}
-  // Defer the inject so PM's UserPromptSubmit hook for the alert can complete first.
-  setTimeout(() => {
-    try {
-      const cmd = `/cleanup-pr ${pr}`;
-      const escaped = shellEscape(cmd);
-      execSync(
-        `tmux send-keys -t ${PM_PANE} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${PM_PANE} Enter`,
-        { timeout: 5000 }
-      );
-      log(`🧹 Injected /cleanup-pr ${pr} into ${PM_PANE}`);
-    } catch (err: any) {
-      log(`❌ cleanup-pr inject error for #${pr}: ${err.message}`);
-    }
-  }, 2000);
-}
+// PR-merge auto-cleanup REMOVED 2026-05-11 18:50 IST per Rajiv directive
+// (thread `1778505655.944859`): *"the slack bridge is still injecting
+// /cleanup-pr into pm pane after every merge. it's not needed anymore.
+// remove it."* CP #13 + pm-context-injector.sh's `[PR_MERGED_DETECTED]`
+// system-reminder is now the sole canonical trigger for the cleanup-pr
+// skill on merge. Prior gradual removal (commit 3809949 2026-05-09)
+// commented out the call site; this removes the function + the supporting
+// regex constants entirely so a stale watch-mode daemon cannot resurrect
+// the inject. See git history (3809949 + this commit) for archaeology.
 
 // Our bot user ID — used to distinguish our @mentions from other bots' @mentions
 const OUR_BOT_USER_ID = "U0ALEAYCAUT";
@@ -529,14 +498,8 @@ app.message(async ({ message, client }) => {
       }
     }
 
-    // PR-merge auto-cleanup REMOVED 2026-05-09 11:24 IST per Rajiv directive
-    // (thread `1778305952.306479`): the duplicate inject was redundant after
-    // pm-context-injector.sh's `[PR_MERGED_DETECTED]` system-reminder hook
-    // started firing on the same Slack alert. CP #13 + the hook drive PM to
-    // dispatch cleanup-pr bg-agent on the merge alert; the slack-bridge inject
-    // was a second trigger PM had to dedup manually. Function definition kept
-    // as dead code below for git-blame archaeology.
-    // maybeInjectCleanupPr(text);
+    // PR-merge /cleanup-pr inject REMOVED — see top-of-file comment block.
+    // Sole canonical trigger is pm-context-injector.sh `[PR_MERGED_DETECTED]`.
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
   }
