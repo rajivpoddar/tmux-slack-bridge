@@ -44,8 +44,28 @@ start() {
   fi
 
   cd "$SCRIPT_DIR"
-  npx tsx slack-bridge.ts >> "$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
+  BRIDGE_SCRIPT_DIR="$SCRIPT_DIR" BRIDGE_LOG_FILE="$LOG_FILE" BRIDGE_PID_FILE="$PID_FILE" python3 - <<'PY'
+import os
+import subprocess
+
+cwd = os.environ["BRIDGE_SCRIPT_DIR"]
+log_path = os.environ["BRIDGE_LOG_FILE"]
+pid_path = os.environ["BRIDGE_PID_FILE"]
+
+log = open(log_path, "ab", buffering=0)
+process = subprocess.Popen(
+    ["npx", "tsx", "slack-bridge.ts"],
+    cwd=cwd,
+    env=os.environ.copy(),
+    stdin=subprocess.DEVNULL,
+    stdout=log,
+    stderr=log,
+    start_new_session=True,
+)
+
+with open(pid_path, "w") as pid_file:
+    pid_file.write(f"{process.pid}\n")
+PY
   echo "✅ Bridge started (PID $(cat "$PID_FILE"))"
   echo "   Logs: $LOG_FILE"
 }

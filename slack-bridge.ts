@@ -20,11 +20,12 @@
  *   ./slack-bridge.sh start
  */
 
-import { App, type GenericMessageEvent } from "@slack/bolt";
+import { App } from "@slack/bolt";
+import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
-import { recordMessage, setThreadOwner, getThreadOwner, closeDb } from "./db.ts";
+import { recordMessage, setThreadOwner, getThreadOwner, getDb, closeDb } from "./db.ts";
 
 // Channel log files — shared read-only feeds for all slots / PM
 const CHANNEL_LOG_FILE = "/tmp/heydonna-dev-channel.log";
@@ -44,6 +45,56 @@ const TMUX_TARGET = process.env.TMUX_TARGET || "0:0.0";
 const BOT_ALLOWED_CHANNELS = new Set(
   (process.env.SLACK_BOT_ALLOWED_CHANNELS || "").split(",").map((s) => s.trim()).filter(Boolean)
 );
+
+const POLL_INTERVAL_MS = Number(process.env.SLACK_HISTORY_POLL_INTERVAL_MS || 30000);
+const POLL_LOOKBACK_SECONDS = Number(process.env.SLACK_HISTORY_POLL_LOOKBACK_SECONDS || 300);
+let lastEventAt = Date.now();
+let pollInFlight = false;
+let pollTimer: NodeJS.Timeout | null = null;
+
+function messageKey(channel: string, ts: string): string {
+  return `${channel}:${ts}`;
+}
+
+const seenMessages = new Set<string>();
+
+function wasRecorded(channel: string, ts: string): boolean {
+  if (seenMessages.has(messageKey(channel, ts))) return true;
+  try {
+    const row = getDb()
+      .prepare("SELECT 1 FROM messages WHERE channel_id = ? AND ts = ? LIMIT 1")
+      .get(channel, ts);
+    if (row) {
+      seenMessages.add(messageKey(channel, ts));
+      return true;
+    }
+  } catch (err: any) {
+    log(`⚠️ DB duplicate-check error for ${channel}/${ts}: ${err.message}`);
+  }
+  return false;
+}
+
+function markSeen(channel: string, ts: string) {
+  seenMessages.add(messageKey(channel, ts));
+  if (seenMessages.size > 5000) {
+    for (const key of seenMessages) {
+      seenMessages.delete(key);
+      if (seenMessages.size <= 4000) break;
+    }
+  }
+}
+
+function latestRecordedTs(channel: string): string | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT ts FROM messages WHERE channel_id = ? ORDER BY CAST(ts AS REAL) DESC LIMIT 1")
+      .get(channel) as { ts?: string | null } | undefined;
+    return row?.ts || null;
+  } catch (err: any) {
+    log(`⚠️ DB latest-ts error for ${channel}: ${err.message}`);
+    return null;
+  }
+}
 
 // --- Preflight checks ---
 function checkTmux(): boolean {
@@ -183,7 +234,7 @@ async function getSnippets(
     ) {
       const content =
         file.preview ||
-        file.plain_text ||
+        (file as any).plain_text ||
         (file.url_private
           ? await fetchFileContent(file.url_private)
           : null);
@@ -327,10 +378,18 @@ async function routeViaMoP(rawText: string, formatted: string, channel: string):
 }
 
 // --- Message Handler ---
-app.message(async ({ message, client }) => {
+async function handleSlackMessage(
+  message: GenericMessageEvent,
+  client: WebClient,
+  source: "socket" | "poll" = "socket"
+): Promise<boolean> {
   const msg = message as GenericMessageEvent;
-  if (!msg.text && !msg.files) return;
-  if (!SLACK_CHANNELS.has(msg.channel)) return;
+  if (!msg.text && !msg.files) return false;
+  if (!SLACK_CHANNELS.has(msg.channel)) return false;
+  if (wasRecorded(msg.channel, msg.ts)) {
+    log(`↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts}`);
+    return false;
+  }
 
   const text = msg.text || "";
 
@@ -342,14 +401,20 @@ app.message(async ({ message, client }) => {
   //   the slack bridge should forward it to the PM"
   // - Non-team bot messages → only forward in BOT_ALLOWED_CHANNELS
   if ("bot_id" in msg && msg.bot_id) {
-    if (!BOT_ALLOWED_CHANNELS.has(msg.channel)) return;
+    if (!BOT_ALLOWED_CHANNELS.has(msg.channel)) {
+      markSeen(msg.channel, msg.ts);
+      return false;
+    }
     const isPmBot = msg.user === "U0ALEAYCAUT";  // Dhruva PM
     const isSlotBot = msg.user && OWN_BOT_USER_IDS.has(msg.user) && !isPmBot;
     if (isPmBot) {
       // PM bot → only forward if has @mentions or @channel (prevents PM→PM loop)
       const hasRoutableContent = /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
         || /<!channel>|<!here>/.test(text);
-      if (!hasRoutableContent) return;
+      if (!hasRoutableContent) {
+        markSeen(msg.channel, msg.ts);
+        return false;
+      }
     }
     // Slot bots → fall through (always forwarded to PM pane)
   }
@@ -368,7 +433,7 @@ app.message(async ({ message, client }) => {
     : await getUserName(client, msg.user);
   const time = formatTimestamp(msg.ts);
 
-  log(`📩 Received from ${userName} at ${time}: ${text}`);
+  log(`📩 Received ${source} from ${userName} at ${time}: ${text}`);
 
   try {
     const parts: string[] = [];
@@ -445,6 +510,7 @@ app.message(async ({ message, client }) => {
         hasImages: imagePaths.length > 0,
         hasSnippets: snippets.length > 0,
       });
+      markSeen(msg.channel, msg.ts);
     } catch (dbErr: any) {
       log(`⚠️ DB record error: ${dbErr.message}`);
     }
@@ -503,6 +569,12 @@ app.message(async ({ message, client }) => {
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
   }
+  return true;
+}
+
+app.message(async ({ message, client }) => {
+  lastEventAt = Date.now();
+  await handleSlackMessage(message as GenericMessageEvent, client, "socket");
 });
 
 // --- Self-Message Router ---
@@ -607,6 +679,62 @@ app.event("app_mention", async ({ event, client }) => {
   }
 });
 
+async function pollSlackHistory(client: WebClient) {
+  if (pollInFlight) return;
+  pollInFlight = true;
+
+  try {
+    for (const channel of SLACK_CHANNELS) {
+      const latestTs = latestRecordedTs(channel);
+      const oldest = latestTs || String(Math.floor(Date.now() / 1000) - POLL_LOOKBACK_SECONDS);
+      const result = await client.conversations.history({
+        channel,
+        oldest,
+        inclusive: false,
+        limit: 50,
+      });
+
+      const messages = (result.messages || [])
+        .filter((m: any) => m.ts && (m.text || m.files))
+        .sort((a: any, b: any) => Number(a.ts) - Number(b.ts));
+
+      let handled = 0;
+      for (const raw of messages) {
+        const msg = { ...raw, channel } as unknown as GenericMessageEvent;
+        if (wasRecorded(channel, msg.ts)) continue;
+        if (await handleSlackMessage(msg, client, "poll")) {
+          handled += 1;
+        }
+      }
+
+      if (handled > 0) {
+        log(`🧭 Poll recovered ${handled} message(s) from ${channel}`);
+      }
+    }
+  } catch (err: any) {
+    log(`⚠️ Slack history poll error: ${err.data?.error || err.message}`);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function startHistoryPoller(client: WebClient) {
+  if (!Number.isFinite(POLL_INTERVAL_MS) || POLL_INTERVAL_MS <= 0) {
+    log("🧭 Slack history poller disabled");
+    return;
+  }
+
+  log(`🧭 Slack history poller every ${Math.round(POLL_INTERVAL_MS / 1000)}s`);
+  pollTimer = setInterval(() => {
+    const secondsSinceEvent = Math.round((Date.now() - lastEventAt) / 1000);
+    log(`💓 Bridge heartbeat: ${secondsSinceEvent}s since last socket event`);
+    void pollSlackHistory(client);
+  }, POLL_INTERVAL_MS);
+  pollTimer.ref();
+
+  void pollSlackHistory(client);
+}
+
 // --- Lifecycle ---
 process.on("SIGINT", async () => {
   log("🛑 Shutting down...");
@@ -620,6 +748,16 @@ process.on("SIGTERM", async () => {
   closeDb();
   await app.stop();
   process.exit(0);
+});
+
+process.on("unhandledRejection", (err: any) => {
+  log(`❌ Unhandled rejection: ${err?.stack || err?.message || err}`);
+});
+
+process.on("uncaughtException", (err: any) => {
+  log(`❌ Uncaught exception: ${err?.stack || err?.message || err}`);
+  closeDb();
+  process.exit(1);
 });
 
 (async () => {
@@ -641,4 +779,5 @@ process.on("SIGTERM", async () => {
   log(`   Bot-allowed:    ${BOT_ALLOWED_CHANNELS.size > 0 ? [...BOT_ALLOWED_CHANNELS].join(", ") : "(none)"}`);
   log(`   @mentions:      enabled (any channel bot is in)`);
   log(`   tmux target:    ${TMUX_TARGET}`);
+  startHistoryPoller(app.client);
 })();

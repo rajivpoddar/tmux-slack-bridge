@@ -65,6 +65,16 @@ export function getDb(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
     CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity);
+
+    -- Thread ownership: routes all thread replies to the pane that owns the thread
+    CREATE TABLE IF NOT EXISTS thread_owners (
+      channel_id TEXT NOT NULL,
+      thread_ts TEXT NOT NULL,
+      target_pane TEXT NOT NULL,
+      owner_bot_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (channel_id, thread_ts)
+    );
   `);
 
   return _db;
@@ -325,6 +335,30 @@ export function getStats(since?: string): {
   `).all(...sinceArgs) as any[];
 
   return { totalMessages, totalThreads, activeThreads, messagesByChannel, messagesByUser };
+}
+
+/**
+ * Record thread ownership — which pane owns this thread.
+ * Called when: (1) MoP routes a message to a slot, (2) a bot posts a new thread.
+ * Uses INSERT OR IGNORE — first writer wins (thread creator owns it).
+ */
+export function setThreadOwner(channelId: string, threadTs: string, targetPane: string, ownerBotId?: string) {
+  const db = getDb();
+  db.prepare(`
+    INSERT OR IGNORE INTO thread_owners (channel_id, thread_ts, target_pane, owner_bot_id)
+    VALUES (?, ?, ?, ?)
+  `).run(channelId, threadTs, targetPane, ownerBotId || null);
+}
+
+/**
+ * Look up who owns a thread. Returns the target pane address (e.g. "0:0.1") or null.
+ */
+export function getThreadOwner(channelId: string, threadTs: string): string | null {
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT target_pane FROM thread_owners WHERE channel_id = ? AND thread_ts = ?"
+  ).get(channelId, threadTs) as { target_pane: string } | undefined;
+  return row?.target_pane || null;
 }
 
 /**
