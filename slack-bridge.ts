@@ -24,7 +24,7 @@ import { App } from "@slack/bolt";
 import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
-import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, renameSync } from "fs";
 import { recordMessage, setThreadOwner, getThreadOwner, getDb, closeDb } from "./db.ts";
 
 // Channel log files — shared read-only feeds for all slots / PM
@@ -71,8 +71,13 @@ function loadLastProcessedTs(channel: string): number | null {
 function saveLastProcessedTs(channel: string, ts: number) {
   let state: Record<string, number> = {};
   try { state = JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
+  // Only ever increase — never regress to an older ts (seeded max > backfill ts).
+  const current = state[channel];
+  if (current !== undefined && ts <= current) return;
   state[channel] = ts;
-  writeFileSync(STATE_FILE, JSON.stringify(state));
+  const tmp = STATE_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(state));
+  renameSync(tmp, STATE_FILE);
 }
 
 function wasRecorded(channel: string, ts: string): boolean {
@@ -404,20 +409,24 @@ async function handleSlackMessage(
   if (!msg.text && !msg.files) return false;
   if (!SLACK_CHANNELS.has(msg.channel)) return false;
 
-  // Backfill dedup: skip if this message is at or before last-processed ts for this channel.
-  // Persists across restarts via STATE_FILE so socket-reconnect backfill doesn't replay.
   const msgTs = parseFloat(msg.ts);
+  const advanceState = (ch: string) => { if (!isNaN(msgTs)) saveLastProcessedTs(ch, msgTs); };
+
+  // 1. DB duplicate check first — advance state on every processed-or-deduped message
+  if (wasRecorded(msg.channel, msg.ts)) {
+    advanceState(msg.channel);
+    log(`↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts}`);
+    return false;
+  }
+
+  // 2. Backfill dedup: skip if <= last-processed ts. Advance state on skip.
   if (!isNaN(msgTs)) {
     const lastTs = loadLastProcessedTs(msg.channel);
     if (lastTs !== null && msgTs <= lastTs) {
+      advanceState(msg.channel);
       log(`SKIP backfill: ${source} channel=${msg.channel} ts=${msgTs} <= last=${lastTs}`);
       return false;
     }
-  }
-
-  if (wasRecorded(msg.channel, msg.ts)) {
-    log(`↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts}`);
-    return false;
   }
 
   const text = msg.text || "";
@@ -432,6 +441,7 @@ async function handleSlackMessage(
   if ("bot_id" in msg && msg.bot_id) {
     if (!BOT_ALLOWED_CHANNELS.has(msg.channel)) {
       markSeen(msg.channel, msg.ts);
+      advanceState(msg.channel);
       return false;
     }
     const isPmBot = msg.user === "U0ALEAYCAUT";  // Dhruva PM
@@ -442,6 +452,7 @@ async function handleSlackMessage(
         || /<!channel>|<!here>/.test(text);
       if (!hasRoutableContent) {
         markSeen(msg.channel, msg.ts);
+        advanceState(msg.channel);
         return false;
       }
     }
@@ -546,7 +557,7 @@ async function handleSlackMessage(
 
     // Persist last-processed timestamp for backfill dedup
     try {
-      if (!isNaN(msgTs)) saveLastProcessedTs(msg.channel, msgTs);
+      advanceState(msg.channel);
     } catch (stateErr: any) {
       log(`⚠️ State file error: ${stateErr.message}`);
     }
