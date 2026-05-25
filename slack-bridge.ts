@@ -58,6 +58,23 @@ function messageKey(channel: string, ts: string): string {
 
 const seenMessages = new Set<string>();
 
+// State file — persists per-channel last-processed Slack ts across restarts.
+// Prevents backfill replay on socket reconnect without a database query.
+const STATE_FILE = '/tmp/slack-bridge-state.json';
+
+function loadLastProcessedTs(channel: string): number | null {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, 'utf-8'))[channel] ?? null;
+  } catch { return null; }
+}
+
+function saveLastProcessedTs(channel: string, ts: number) {
+  let state: Record<string, number> = {};
+  try { state = JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
+  state[channel] = ts;
+  writeFileSync(STATE_FILE, JSON.stringify(state));
+}
+
 function wasRecorded(channel: string, ts: string): boolean {
   if (seenMessages.has(messageKey(channel, ts))) return true;
   try {
@@ -386,6 +403,18 @@ async function handleSlackMessage(
   const msg = message as GenericMessageEvent;
   if (!msg.text && !msg.files) return false;
   if (!SLACK_CHANNELS.has(msg.channel)) return false;
+
+  // Backfill dedup: skip if this message is at or before last-processed ts for this channel.
+  // Persists across restarts via STATE_FILE so socket-reconnect backfill doesn't replay.
+  const msgTs = parseFloat(msg.ts);
+  if (!isNaN(msgTs)) {
+    const lastTs = loadLastProcessedTs(msg.channel);
+    if (lastTs !== null && msgTs <= lastTs) {
+      log(`SKIP backfill: ${source} channel=${msg.channel} ts=${msgTs} <= last=${lastTs}`);
+      return false;
+    }
+  }
+
   if (wasRecorded(msg.channel, msg.ts)) {
     log(`↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts}`);
     return false;
@@ -513,6 +542,13 @@ async function handleSlackMessage(
       markSeen(msg.channel, msg.ts);
     } catch (dbErr: any) {
       log(`⚠️ DB record error: ${dbErr.message}`);
+    }
+
+    // Persist last-processed timestamp for backfill dedup
+    try {
+      if (!isNaN(msgTs)) saveLastProcessedTs(msg.channel, msgTs);
+    } catch (stateErr: any) {
+      log(`⚠️ State file error: ${stateErr.message}`);
     }
 
     // Append to shared channel log files (slots / PM can read anytime)
