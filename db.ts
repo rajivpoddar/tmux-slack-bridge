@@ -15,7 +15,8 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "bridge.db");
+// Test override: set DB_PATH env to use a different database file (e.g. :memory: or temp path)
+const DB_PATH = process.env.DB_PATH || join(__dirname, "bridge.db");
 
 let _db: Database.Database | null = null;
 
