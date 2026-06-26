@@ -424,6 +424,8 @@ async function handleSlackMessage(
   const msg = message as GenericMessageEvent;
   if (!msg.text && !msg.files) return false;
   if (!SLACK_CHANNELS.has(msg.channel)) return false;
+
+  // 1. DB duplicate check first
   if (wasRecorded(msg.channel, msg.ts)) {
     log(`↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts}`);
     return false;
@@ -813,3 +815,7 @@ process.on("uncaughtException", (err: any) => {
   log(`   tmux target:    ${TMUX_TARGET}`);
   startHistoryPoller(app.client);
 })();
+
+// --- Test exports ---
+export { wasRecorded, markSeen, latestRecordedTs };
+export type { GenericMessageEvent };
