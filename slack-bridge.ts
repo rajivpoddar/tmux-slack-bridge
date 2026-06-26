@@ -45,6 +45,12 @@ const TMUX_TARGET = process.env.TMUX_TARGET || "0:0.0";
 const BOT_ALLOWED_CHANNELS = new Set(
   (process.env.SLACK_BOT_ALLOWED_CHANNELS || "").split(",").map((s) => s.trim()).filter(Boolean)
 );
+const USER_AUTHORED_BOT_FORWARD_USER_IDS = new Set(
+  (process.env.SLACK_USER_AUTHORED_BOT_FORWARD_USER_IDS || "UEQTTB97A")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
 
 const POLL_INTERVAL_MS = Number(process.env.SLACK_HISTORY_POLL_INTERVAL_MS || 30000);
 const POLL_LOOKBACK_SECONDS = Number(process.env.SLACK_HISTORY_POLL_LOOKBACK_SECONDS || 300);
@@ -350,6 +356,38 @@ const BOT_TO_PANE: Record<string, string> = {
   "U0AMEUZPQ5N": "0:0.4",  // Chitra QA (slot 4)
 };
 
+function hasBotId(msg: GenericMessageEvent): boolean {
+  return "bot_id" in msg && !!msg.bot_id;
+}
+
+function isUserAuthoredBotDm(msg: GenericMessageEvent): boolean {
+  return (
+    msg.channel.startsWith("D") &&
+    typeof msg.user === "string" &&
+    USER_AUTHORED_BOT_FORWARD_USER_IDS.has(msg.user)
+  );
+}
+
+function hasRoutableSlotMention(text: string): boolean {
+  return /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
+    || /<!channel>|<!here>/.test(text);
+}
+
+function botDropReason(msg: GenericMessageEvent, text: string): string | null {
+  if (!hasBotId(msg)) return null;
+
+  const isPmBot = msg.user === OUR_BOT_USER_ID;
+  if (!BOT_ALLOWED_CHANNELS.has(msg.channel) && !isUserAuthoredBotDm(msg)) {
+    return `bot_messages_not_allowed_in_${msg.channel}`;
+  }
+
+  if (isPmBot && !hasRoutableSlotMention(text)) {
+    return "pm_bot_without_routable_mention";
+  }
+
+  return null;
+}
+
 // MoP routing endpoint (for @mention-based per-slot routing)
 const MOP_ROUTE_URL = process.env.MOP_ROUTE_URL || "http://localhost:3100/api/slack-route";
 
@@ -400,23 +438,18 @@ async function handleSlackMessage(
   //   Rajiv directive (2026-03-22): "whenever a dev/qa posts on heydonna-dev channel,
   //   the slack bridge should forward it to the PM"
   // - Non-team bot messages → only forward in BOT_ALLOWED_CHANNELS
-  if ("bot_id" in msg && msg.bot_id) {
-    if (!BOT_ALLOWED_CHANNELS.has(msg.channel)) {
-      markSeen(msg.channel, msg.ts);
-      return false;
-    }
-    const isPmBot = msg.user === "U0ALEAYCAUT";  // Dhruva PM
-    const isSlotBot = msg.user && OWN_BOT_USER_IDS.has(msg.user) && !isPmBot;
-    if (isPmBot) {
-      // PM bot → only forward if has @mentions or @channel (prevents PM→PM loop)
-      const hasRoutableContent = /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
-        || /<!channel>|<!here>/.test(text);
-      if (!hasRoutableContent) {
-        markSeen(msg.channel, msg.ts);
-        return false;
-      }
-    }
+  const botDrop = botDropReason(msg, text);
+  if (botDrop) {
+    markSeen(msg.channel, msg.ts);
+    log(
+      `🚫 Dropped ${source} bot message ${msg.channel}/${msg.ts}: ${botDrop}; user=${msg.user || "none"} bot_id=${(msg as any).bot_id || "none"}`
+    );
+    return false;
+  }
+  if (hasBotId(msg)) {
     // Slot bots → fall through (always forwarded to PM pane)
+    // Rajiv-authored app posts in DMs also fall through so bot-token postbacks
+    // are not silently lost before reaching the PM pane.
   }
 
   // Note: Previously filtered messages @mentioning non-bot users (lines 266-269).
@@ -532,7 +565,7 @@ async function handleSlackMessage(
     // Route via MoP for @mention-based per-slot delivery
     // For channel messages with @mentions, MoP routes to the mentioned slot(s)
     // For DMs or messages without slot mentions, sends directly to PM pane
-    const hasSlotMentions = !isDM && (/<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text) || /<!channel>|<!here>/.test(text));
+    const hasSlotMentions = !isDM && hasRoutableSlotMention(text);
     if (hasSlotMentions) {
       const routed = await routeViaMoP(text, fullMessage, msg.channel);
       if (routed) {
@@ -589,8 +622,7 @@ app.event("message", async ({ event, client }) => {
 
   const text = msg.text || "";
   // Only route if message has @mentions or @channel — prevents infinite loops
-  const hasRoutableContent = /<@U0(AMETSAHC0|ALE8Z8X2P|AMEUQ8DR6|AMEUZPQ5N)>/.test(text)
-    || /<!channel>|<!here>/.test(text);
+  const hasRoutableContent = hasRoutableSlotMention(text);
   if (!hasRoutableContent) return;
 
   log(`📩 [self-route] Own bot message with routing: ${text.slice(0, 100)}`);
