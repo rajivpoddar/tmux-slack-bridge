@@ -53,11 +53,26 @@ const origFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error("No network in test"); };
 
 // --- Imports ---
-import { getDb, recordMessage, closeDb } from "./db";
-import { wasRecorded, markSeen, latestRecordedTs } from "./slack-bridge";
+// Import after env setup. Static ESM imports execute before this file body and
+// can start the bridge with the real local .env during tests.
+let getDb: typeof import("./db.ts").getDb;
+let recordMessage: typeof import("./db.ts").recordMessage;
+let closeDb: typeof import("./db.ts").closeDb;
+let wasRecorded: typeof import("./slack-bridge.ts").wasRecorded;
+let markSeen: typeof import("./slack-bridge.ts").markSeen;
+let latestRecordedTs: typeof import("./slack-bridge.ts").latestRecordedTs;
 
 describe("crash-recovery watermark guard (#4984)", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
+    const db = await import("./db.ts");
+    const bridge = await import("./slack-bridge.ts");
+    getDb = db.getDb;
+    recordMessage = db.recordMessage;
+    closeDb = db.closeDb;
+    wasRecorded = bridge.wasRecorded;
+    markSeen = bridge.markSeen;
+    latestRecordedTs = bridge.latestRecordedTs;
+
     getDb();
   });
 
