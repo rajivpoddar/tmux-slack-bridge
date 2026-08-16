@@ -324,14 +324,19 @@ async function downloadImages(
 /**
  * Send text to the target tmux pane via send-keys.
  * Uses -l (literal) to prevent tmux from interpreting special characters.
+ * PM-pane delivery is busy-aware: confirmed idle -> Enter, busy or unknown ->
+ * C-q (OMP follow-up). Dev-slot delivery remains Enter/steering.
  */
-function sendToPane(text: string, target?: string) {
+export async function sendToPane(text: string, target?: string) {
   const pane = target || TMUX_TARGET;
   const escaped = shellEscape(text);
+  const pmBusy = pane === "0:0.0" ? await pmBusyState() : null;
+  const submitKey = resolveSubmitKey(pane, pmBusy);
   execSync(
-    `tmux send-keys -t ${pane} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${pane} Enter`,
+    `tmux send-keys -t ${pane} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${pane} ${submitKey}`,
     { timeout: 5000 }
   );
+  log(`✅ sendToPane ${pane} submit=${submitKey} pm_busy=${pmBusy === null ? "unknown" : pmBusy}`);
 }
 
 // PR-merge auto-cleanup REMOVED 2026-05-11 18:50 IST per Rajiv directive
@@ -390,6 +395,42 @@ function botDropReason(msg: GenericMessageEvent, text: string): string | null {
 
 // MoP routing endpoint (for @mention-based per-slot routing)
 const MOP_ROUTE_URL = process.env.MOP_ROUTE_URL || "http://localhost:3100/api/slack-route";
+// Authoritative PM-busy signal used by MoP/OMP (setPMBusy from PM hooks).
+const PM_STATUS_URL = process.env.MOP_PM_STATUS_URL || "http://localhost:3100/pm-status";
+
+/**
+ * Read the authoritative PM busy state from MoP. Returns true when PM is
+ * busy, false when idle, and null when the signal is unknown/unreachable so
+ * callers can fail closed to queued (C-q) delivery.
+ */
+export async function pmBusyState(): Promise<boolean | null> {
+  try {
+    const res = await fetch(PM_STATUS_URL, {
+      signal: AbortSignal.timeout(2000),
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { pm_busy?: unknown };
+    if (typeof body.pm_busy !== "boolean") return null;
+    return body.pm_busy;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Choose the terminal submit key for a tmux pane delivery.
+ *
+ * Dev-slot panes keep Enter/steering exactly unchanged. PM-pane (0:0.0)
+ * delivery uses C-q (OMP follow-up queue) when PM is busy OR the busy signal
+ * is unknown, so automated messages queue rather than steer/interleave; Enter
+ * is used only when PM is confirmed idle.
+ */
+export function resolveSubmitKey(pane: string, pmBusy: boolean | null): "Enter" | "C-q" {
+  if (pane !== "0:0.0") return "Enter";
+  if (pmBusy !== false) return "C-q";
+  return "Enter";
+}
 
 /**
  * Route a message via MoP for @mention-based per-slot delivery.
@@ -579,7 +620,7 @@ async function handleSlackMessage(
         }
       } else {
         // Fallback: send to PM pane directly
-        sendToPane(fullMessage);
+        await sendToPane(fullMessage);
         log(`✅ Forwarded to ${TMUX_TARGET} (MoP fallback)`);
       }
     } else {
@@ -590,11 +631,11 @@ async function handleSlackMessage(
 
       if (threadOwnerPane && threadOwnerPane !== TMUX_TARGET) {
         // Route to thread owner pane AND PM pane (PM always gets a copy)
-        sendToPane(fullMessage, threadOwnerPane);
-        sendToPane(fullMessage);
+        await sendToPane(fullMessage, threadOwnerPane);
+        await sendToPane(fullMessage);
         log(`✅ Forwarded to ${threadOwnerPane} (thread owner) + ${TMUX_TARGET} (PM copy)`);
       } else {
-        sendToPane(fullMessage);
+        await sendToPane(fullMessage);
         log(`✅ Forwarded to ${TMUX_TARGET}`);
       }
     }
@@ -706,7 +747,7 @@ app.event("app_mention", async ({ event, client }) => {
       log(`⚠️ DB record error: ${dbErr.message}`);
     }
 
-    sendToPane(fullMessage);
+    await sendToPane(fullMessage);
     log(`✅ @mention forwarded to ${TMUX_TARGET}`);
   } catch (err: any) {
     log(`❌ tmux error: ${err.message}`);
