@@ -441,23 +441,25 @@ export async function pmSessionRecentlyActive(): Promise<boolean | null> {
  * - unknown (null) otherwise -> caller fails closed to C-q (queued follow-up).
  */
 export async function pmBusyState(): Promise<boolean | null> {
-  let moP: boolean | null = null;
   try {
     const res = await fetch(PM_STATUS_URL, {
       signal: AbortSignal.timeout(2000),
       headers: { Accept: "application/json" },
     });
-    if (res.ok) {
-      const body = (await res.json()) as { pm_busy?: unknown };
-      if (typeof body.pm_busy === "boolean") moP = body.pm_busy;
-    }
+    if (!res.ok) return null;
+    const body = (await res.json()) as { pm_busy?: unknown };
+    if (typeof body.pm_busy !== "boolean") return null;
+    const moP = body.pm_busy;
+    if (moP === true) return true;
+    // MoP confirms idle: cross-check OMP session JSONL recency to catch a
+    // stale false (the hook feed is not maintained under the OMP PM runtime).
+    const jsonlRecent = await pmSessionRecentlyActive();
+    if (jsonlRecent === true) return true;
+    if (jsonlRecent === false) return false;
+    return null;
   } catch {
-    moP = null;
+    return null;
   }
-  const jsonlRecent = await pmSessionRecentlyActive();
-  if (moP === true || jsonlRecent === true) return true;
-  if (moP === false && jsonlRecent === false) return false;
-  return null;
 }
 
 /**
