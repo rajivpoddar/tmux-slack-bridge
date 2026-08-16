@@ -9,6 +9,13 @@
  */
 import { describe, test, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
 import { execSync } from "child_process";
+import { mkdtempSync, writeFileSync, utimesSync, readdirSync, unlinkSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+
+const PM_SESSION_DIR = mkdtempSync(join(tmpdir(), "bridge-cq-session-"));
+process.env.BRIDGE_PM_SESSION_DIR = PM_SESSION_DIR;
+process.env.BRIDGE_PM_JSONL_IDLE_MS = "15000";
 
 process.env.TMUX_TARGET = "0:0.0";
 process.env.SLACK_CHANNEL = "C0TESTCQ";
@@ -40,12 +47,14 @@ const origFetch = globalThis.fetch;
 let sendToPane: (text: string, target?: string) => Promise<void>;
 let resolveSubmitKey: (pane: string, pmBusy: boolean | null) => "Enter" | "C-q";
 let pmBusyState: () => Promise<boolean | null>;
+let pmSessionRecentlyActive: () => Promise<boolean | null>;
 
 beforeAll(async () => {
   const bridge = await import("./slack-bridge.ts");
   sendToPane = bridge.sendToPane;
   resolveSubmitKey = bridge.resolveSubmitKey;
   pmBusyState = bridge.pmBusyState;
+  pmSessionRecentlyActive = bridge.pmSessionRecentlyActive;
 });
 
 afterAll(() => {
@@ -59,6 +68,13 @@ afterEach(() => {
 
 function fetchReturning(body: unknown, ok = true) {
   globalThis.fetch = (async () => ({ ok, json: async () => body })) as typeof fetch;
+}
+
+function writeSession(ageSeconds: number, name = "session.jsonl") {
+  const path = join(PM_SESSION_DIR, name);
+  writeFileSync(path, "x\n");
+  const mtime = (Date.now() - ageSeconds * 1000) / 1000;
+  utimesSync(path, mtime, mtime);
 }
 
 describe("resolveSubmitKey", () => {
@@ -88,32 +104,50 @@ describe("pmBusyState", () => {
     expect(await pmBusyState()).toBe(true);
   });
 
-  test("returns false when MoP reports pm_busy=false", async () => {
+  test("returns true when MoP reports false but PM session JSONL is fresh", async () => {
+    writeSession(2);
+    fetchReturning({ pm_busy: false });
+    expect(await pmBusyState()).toBe(true);
+  });
+
+  test("returns false only when MoP reports false AND session JSONL is quiet", async () => {
+    writeSession(120);
     fetchReturning({ pm_busy: false });
     expect(await pmBusyState()).toBe(false);
   });
 
   test("returns null on HTTP error", async () => {
+    writeSession(120);
     fetchReturning({}, false);
     expect(await pmBusyState()).toBeNull();
   });
 
   test("returns null on malformed body", async () => {
+    writeSession(120);
     fetchReturning({ pm_busy: "yes" });
     expect(await pmBusyState()).toBeNull();
   });
 
   test("returns null on network error", async () => {
+    writeSession(120);
     globalThis.fetch = (async () => {
       throw new Error("network down");
     }) as typeof fetch;
     expect(await pmBusyState()).toBeNull();
+  });
+
+  test("returns null when no PM session evidence exists (fail closed)", async () => {
+    for (const name of readdirSync(PM_SESSION_DIR)) {
+      if (name.endsWith(".jsonl")) unlinkSync(join(PM_SESSION_DIR, name));
+    }
+    expect(await pmSessionRecentlyActive()).toBeNull();
   });
 });
 
 describe("sendToPane busy-aware delivery", () => {
   test("PM busy -> command submits with C-q", async () => {
     fetchReturning({ pm_busy: true });
+    writeSession(120);
     await sendToPane("# probe busy", "0:0.0");
     const cmd = vi.mocked(execSync).mock.calls[0]![0] as string;
     expect(cmd).toContain("tmux send-keys -t 0:0.0");
@@ -122,6 +156,7 @@ describe("sendToPane busy-aware delivery", () => {
   });
 
   test("PM idle -> command submits with Enter", async () => {
+    writeSession(120);
     fetchReturning({ pm_busy: false });
     await sendToPane("# probe idle", "0:0.0");
     const cmd = vi.mocked(execSync).mock.calls[0]![0] as string;
@@ -129,7 +164,16 @@ describe("sendToPane busy-aware delivery", () => {
     expect(cmd).not.toContain("C-q");
   });
 
+  test("PM busy via fresh session JSONL (MoP false) -> C-q", async () => {
+    writeSession(2);
+    fetchReturning({ pm_busy: false });
+    await sendToPane("# probe busy-jsonl", "0:0.0");
+    const cmd = vi.mocked(execSync).mock.calls[0]![0] as string;
+    expect(cmd).toContain("C-q");
+  });
+
   test("PM unknown/error -> command submits with C-q", async () => {
+    writeSession(120);
     globalThis.fetch = (async () => {
       throw new Error("mop down");
     }) as typeof fetch;
@@ -139,6 +183,7 @@ describe("sendToPane busy-aware delivery", () => {
   });
 
   test("dev slot -> command submits with Enter even when PM busy", async () => {
+    writeSession(2);
     fetchReturning({ pm_busy: true });
     await sendToPane("# probe slot1", "0:0.1");
     const cmd = vi.mocked(execSync).mock.calls[0]![0] as string;

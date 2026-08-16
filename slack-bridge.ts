@@ -25,6 +25,8 @@ import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
+import { readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
 import { recordMessage, setThreadOwner, getThreadOwner, getDb, closeDb } from "./db.ts";
 
 // Channel log files — shared read-only feeds for all slots / PM
@@ -397,25 +399,65 @@ function botDropReason(msg: GenericMessageEvent, text: string): string | null {
 const MOP_ROUTE_URL = process.env.MOP_ROUTE_URL || "http://localhost:3100/api/slack-route";
 // Authoritative PM-busy signal used by MoP/OMP (setPMBusy from PM hooks).
 const PM_STATUS_URL = process.env.MOP_PM_STATUS_URL || "http://localhost:3100/pm-status";
+// OMP PM session dir — the live PM runtime writes here; recency is the same
+// JSONL-mtime busy heuristic the MoP relay uses before injecting.
+const PM_SESSION_DIR =
+  process.env.BRIDGE_PM_SESSION_DIR || `${process.env.HOME || "/Users/rajiv"}/.omp/sessions/heydonna-pm`;
+// Mirror MoP PM_JSONL_IDLE_MS default (15s): a fresher PM session write means
+// PM is actively producing tokens and automated delivery must queue (C-q).
+const PM_JSONL_IDLE_MS: number = (() => {
+  const raw = process.env.BRIDGE_PM_JSONL_IDLE_MS;
+  const n = raw ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 15_000;
+})();
 
 /**
  * Read the authoritative PM busy state from MoP. Returns true when PM is
  * busy, false when idle, and null when the signal is unknown/unreachable so
  * callers can fail closed to queued (C-q) delivery.
  */
+export async function pmSessionRecentlyActive(): Promise<boolean | null> {
+  try {
+    const names = await readdir(PM_SESSION_DIR);
+    const jsonls = names.filter((name) => name.endsWith(".jsonl"));
+    if (jsonls.length === 0) return null;
+    let newestMs = 0;
+    for (const name of jsonls) {
+      const entry = await stat(join(PM_SESSION_DIR, name));
+      if (entry.mtimeMs > newestMs) newestMs = entry.mtimeMs;
+    }
+    return Date.now() - newestMs < PM_JSONL_IDLE_MS;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deterministic busy decision used by PM-pane delivery:
+ * - busy (true) when MoP reports pm_busy=true OR the OMP PM session JSONL was
+ *   written within the idle window (PM actively producing);
+ * - idle (false) only when MoP confirms pm_busy=false AND the session JSONL
+ *   is quiet;
+ * - unknown (null) otherwise -> caller fails closed to C-q (queued follow-up).
+ */
 export async function pmBusyState(): Promise<boolean | null> {
+  let moP: boolean | null = null;
   try {
     const res = await fetch(PM_STATUS_URL, {
       signal: AbortSignal.timeout(2000),
       headers: { Accept: "application/json" },
     });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { pm_busy?: unknown };
-    if (typeof body.pm_busy !== "boolean") return null;
-    return body.pm_busy;
+    if (res.ok) {
+      const body = (await res.json()) as { pm_busy?: unknown };
+      if (typeof body.pm_busy === "boolean") moP = body.pm_busy;
+    }
   } catch {
-    return null;
+    moP = null;
   }
+  const jsonlRecent = await pmSessionRecentlyActive();
+  if (moP === true || jsonlRecent === true) return true;
+  if (moP === false && jsonlRecent === false) return false;
+  return null;
 }
 
 /**
