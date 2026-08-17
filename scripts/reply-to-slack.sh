@@ -145,22 +145,42 @@ try:
     replied_tool_seen = False
     reply_ok_seen = False
     for line in lines[-50:]:
-        raw_line = line.strip()
-        if '"ok": true' in raw_line or '"ok":true' in raw_line:
-            reply_ok_seen = True
         try:
             obj = json.loads(line.strip())
-            for block in obj.get('message', {}).get('content', []):
-                if block.get('type') == 'tool_use':
-                    tool_name = block.get('name', '')
-                    if 'add_message' in tool_name or 'send_message' in tool_name:
-                        replied_tool_seen = True
-                    elif tool_name == 'Bash':
-                        cmd = block.get('input', {}).get('command', '')
-                        if 'chat.postMessage' in cmd and thread_ts in cmd:
-                            replied_tool_seen = True
         except Exception:
-            pass
+            continue
+        content_blocks = obj.get('message', {}).get('content', [])
+        for block in content_blocks:
+            if block.get('type') == 'tool_use':
+                tool_name = block.get('name', '')
+                tool_input = block.get('input', {})
+                input_text = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+                owned_target = channel in input_text and thread_ts in input_text
+                if 'add_message' in tool_name or 'send_message' in tool_name:
+                    if owned_target:
+                        replied_tool_seen = True
+                elif tool_name == 'Bash':
+                    cmd = input_text
+                    if 'chat.postMessage' in cmd and owned_target:
+                        replied_tool_seen = True
+            elif block.get('type') == 'tool_result':
+                content = block.get('content')
+                candidates = []
+                if isinstance(content, str):
+                    candidates.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            candidates.append(item.get('text', ''))
+                for candidate in candidates:
+                    compact = candidate.replace(' ', '')
+                    if (
+                        '"ok":true' in compact
+                        and f'"channel":"{channel}"' in compact
+                        and '"ts":"' in compact
+                    ):
+                        reply_ok_seen = True
+                        break
     if replied_tool_seen:
         if reply_ok_seen:
             commit_removal()
