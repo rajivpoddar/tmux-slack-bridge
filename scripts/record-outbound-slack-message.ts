@@ -1,3 +1,4 @@
+import { readFileSync } from "fs";
 import { resolve } from "path";
 import { pathToFileURL } from "url";
 import { closeDb, recordOutboundMessage } from "../db.ts";
@@ -84,8 +85,7 @@ export function persistVerifiedOutboundSlackMessage(
   return recordOutboundMessage(record);
 }
 
-function parseJsonEnv(name: string): unknown {
-  const raw = process.env[name];
+function parseJson(raw: string | undefined): unknown {
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -94,16 +94,28 @@ function parseJsonEnv(name: string): unknown {
   }
 }
 
+function parseStdin(): { payload: unknown; response: unknown } | null {
+  let raw = "";
+  try {
+    raw = readFileSync(0, "utf8");
+  } catch {
+    return null;
+  }
+  const [payloadRaw, responseRaw] = raw.split(/\r?\n/, 2);
+  const payload = parseJson(payloadRaw);
+  const response = parseJson(responseRaw);
+  return payload && response ? { payload, response } : null;
+}
+
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : "";
 if (import.meta.url === invokedPath) {
-  const payload = parseJsonEnv("SLACK_POST_PAYLOAD") || parseJsonEnv("CURL_PAYLOAD");
-  const response = parseJsonEnv("SLACK_POST_RESPONSE");
+  const parsed = parseStdin();
 
-  if (payload && response) {
+  if (parsed) {
     try {
       persistVerifiedOutboundSlackMessage(
-        payload as SlackPostPayload,
-        response as SlackPostResponse
+        parsed.payload as SlackPostPayload,
+        parsed.response as SlackPostResponse
       );
     } finally {
       closeDb();

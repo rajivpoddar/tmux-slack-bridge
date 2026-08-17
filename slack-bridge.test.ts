@@ -11,7 +11,7 @@
  * are processed (not skipped by watermark).
  */
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
-import { unlinkSync, existsSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -62,6 +62,7 @@ let closeDb: typeof import("./db.ts").closeDb;
 let wasRecorded: typeof import("./slack-bridge.ts").wasRecorded;
 let markSeen: typeof import("./slack-bridge.ts").markSeen;
 let latestRecordedTs: typeof import("./slack-bridge.ts").latestRecordedTs;
+let appendReplyContextQueue: typeof import("./slack-bridge.ts").appendReplyContextQueue;
 
 describe("crash-recovery watermark guard (#4984)", () => {
   beforeAll(async () => {
@@ -74,6 +75,7 @@ describe("crash-recovery watermark guard (#4984)", () => {
     wasRecorded = bridge.wasRecorded;
     markSeen = bridge.markSeen;
     latestRecordedTs = bridge.latestRecordedTs;
+    appendReplyContextQueue = bridge.appendReplyContextQueue;
 
     getDb();
   });
@@ -188,6 +190,26 @@ describe("crash-recovery watermark guard (#4984)", () => {
     record(ch, "400.001", "original");
     // Same ts arrives again via socket reconnect
     expect(wasRecorded(ch, "400.001")).toBe(true);
+  });
+
+  test("appendReplyContextQueue records reply targets without changing routing state", () => {
+    const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
+    try {
+      expect(appendReplyContextQueue("C0QUEUE", "700.001", queueFile)).toBe(true);
+      const queue = JSON.parse(readFileSync(queueFile, "utf8"));
+      expect(queue).toEqual([{ channel: "C0QUEUE", thread_ts: "700.001" }]);
+    } finally {
+      if (existsSync(queueFile)) unlinkSync(queueFile);
+    }
+  });
+
+  test("appendReplyContextQueue is best-effort on write failure", () => {
+    const queueDir = mkdtempSync(join(tmpdir(), "bridge-reply-context-dir-"));
+    try {
+      expect(appendReplyContextQueue("C0QUEUE", "700.002", queueDir)).toBe(false);
+    } finally {
+      rmSync(queueDir, { recursive: true, force: true });
+    }
   });
 
   test("recordMessage atomically claims a (channel, ts) exactly once", () => {

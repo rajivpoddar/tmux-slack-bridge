@@ -154,6 +154,31 @@ function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+export function appendReplyContextQueue(
+  channel: string,
+  threadTs: string,
+  queueFile = "/tmp/slack-bridge-last-inject.json"
+): boolean {
+  try {
+    const queue = existsSync(queueFile)
+      ? (() => {
+          try {
+            const d = JSON.parse(readFileSync(queueFile, "utf8"));
+            return Array.isArray(d) ? d : [d];
+          } catch {
+            return [];
+          }
+        })()
+      : [];
+    queue.push({ channel, thread_ts: threadTs });
+    writeFileSync(queueFile, JSON.stringify(queue));
+    return true;
+  } catch (err: any) {
+    log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
+    return false;
+  }
+}
+
 function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
@@ -643,12 +668,7 @@ async function handleSlackMessage(
     // Append to inject queue only after the DB claim succeeds. This queue is
     // outbound reply context for the PM Stop hook; duplicate inbound events that
     // lose the claim must not leave stale reply targets behind.
-    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
-    const queue = existsSync(QUEUE_FILE)
-      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
-      : [];
-    queue.push({ channel: msg.channel, thread_ts: threadTs });
-    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
+    appendReplyContextQueue(msg.channel, threadTs);
 
     // Append to shared channel log files (slots / PM can read anytime)
     if (msg.channel === HEYDONNA_DEV_CHANNEL) {
@@ -809,12 +829,7 @@ app.event("app_mention", async ({ event, client }) => {
       return;
     }
 
-    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
-    const queue = existsSync(QUEUE_FILE)
-      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
-      : [];
-    queue.push({ channel: event.channel, thread_ts: threadTs });
-    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
+    appendReplyContextQueue(event.channel, threadTs);
 
     await sendToPane(fullMessage);
     log(`✅ @mention forwarded to ${TMUX_TARGET}`);

@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { existsSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { spawnSync } from "child_process";
+import Database from "better-sqlite3";
 
 const TEST_DB = join(tmpdir(), `bridge-outbound-${Date.now()}.db`);
 process.env.DB_PATH = TEST_DB;
@@ -127,5 +129,47 @@ describe("verified outbound Slack recording", () => {
     ).toBe(false);
 
     expect(countRows(text)).toBe(1);
+  });
+
+  test("CLI records from stdin without payload or response environment variables", () => {
+    const cliDb = join(tmpdir(), `bridge-outbound-cli-${Date.now()}.db`);
+    const text = "bridge obligation 752 stdin recorder";
+    const payload = JSON.stringify({
+      channel: "C0OUTBOUND",
+      thread_ts: "1786941665.403559",
+      text,
+    });
+    const response = JSON.stringify({
+      ok: true,
+      channel: "C0OUTBOUND",
+      ts: "1787000000.000300",
+    });
+
+    try {
+      const result = spawnSync(
+        "npx",
+        ["--no-install", "tsx", "scripts/record-outbound-slack-message.ts"],
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, DB_PATH: cliDb },
+          input: `${payload}\n${response}\n`,
+          encoding: "utf8",
+        }
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      const raw = new Database(cliDb);
+      const row = raw
+        .prepare("SELECT direction, body FROM messages WHERE channel_id = ? AND ts = ?")
+        .get("C0OUTBOUND", "1787000000.000300") as any;
+      raw.close();
+
+      expect(row).toMatchObject({ direction: "outbound", body: text });
+    } finally {
+      if (existsSync(cliDb)) unlinkSync(cliDb);
+      if (existsSync(`${cliDb}-shm`)) unlinkSync(`${cliDb}-shm`);
+      if (existsSync(`${cliDb}-wal`)) unlinkSync(`${cliDb}-wal`);
+    }
   });
 });

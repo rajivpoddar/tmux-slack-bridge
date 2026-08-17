@@ -187,9 +187,8 @@ if [ -n "$SLACK_POST_RESPONSE" ]; then
   if [ -d "$BRIDGE_DIR" ]; then
     (
       cd "$BRIDGE_DIR" || exit 0
-      SLACK_POST_PAYLOAD="$CURL_PAYLOAD" \
-      SLACK_POST_RESPONSE="$SLACK_POST_RESPONSE" \
-        npx --no-install tsx scripts/record-outbound-slack-message.ts
+      printf '%s\n%s\n' "$CURL_PAYLOAD" "$SLACK_POST_RESPONSE" \
+        | npx --no-install tsx scripts/record-outbound-slack-message.ts
     ) >/dev/null 2>&1 || true
   fi
 fi
