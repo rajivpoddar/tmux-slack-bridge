@@ -25,7 +25,7 @@ import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, openSync, closeSync, unlinkSync } from "fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { recordMessage, setThreadOwner, getThreadOwner, getDb, closeDb } from "./db.ts";
@@ -155,47 +155,97 @@ function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withQueueLock<T>(
+  queueFile: string,
+  fn: () => T
+): T | null {
+  const lockPath = `${queueFile}.lock`;
+  const configuredTimeout = Number(process.env.BRIDGE_REPLY_CONTEXT_LOCK_TIMEOUT_MS || 0);
+  const lockTimeoutMs =
+    Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? configuredTimeout
+      : 1500;
+  const deadline = Date.now() + lockTimeoutMs;
+  let fd: number | null = null;
+  while (Date.now() < deadline) {
+    try {
+      fd = openSync(lockPath, "wx");
+      break;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") {
+        log(`⚠️ Failed to acquire Slack reply context queue lock: ${error?.message || error}`);
+        return null;
+      }
+      sleepSync(25);
+    }
+  }
+  if (fd === null) {
+    log(`⚠️ Slack reply context queue lock timeout: ${lockPath}`);
+    return null;
+  }
+  try {
+    closeSync(fd);
+    return fn();
+  } finally {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Lock cleanup is best-effort; a stale lock times out on the next writer.
+    }
+  }
+}
+
 export function appendReplyContextQueue(
   channel: string,
   threadTs: string,
   ts: string,
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): string | null {
-  try {
-    let queue: unknown[] = [];
-    if (existsSync(queueFile)) {
-      const d = JSON.parse(readFileSync(queueFile, "utf8"));
-      if (d === null || typeof d !== "object") return null;
-      queue = Array.isArray(d) ? d : [d];
+  return withQueueLock(queueFile, () => {
+    try {
+      let queue: unknown[] = [];
+      if (existsSync(queueFile)) {
+        const d = JSON.parse(readFileSync(queueFile, "utf8"));
+        if (d === null || typeof d !== "object") return null;
+        queue = Array.isArray(d) ? d : [d];
+      }
+      const entryId = randomUUID();
+      queue.push({ id: entryId, channel, thread_ts: threadTs, ts });
+      writeFileSync(queueFile, JSON.stringify(queue));
+      return entryId;
+    } catch (err: any) {
+      log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
+      return null;
     }
-    const entryId = randomUUID();
-    queue.push({ id: entryId, channel, thread_ts: threadTs, ts });
-    writeFileSync(queueFile, JSON.stringify(queue));
-    return entryId;
-  } catch (err: any) {
-    log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
-    return null;
-  }
+  });
 }
 
 export function removeReplyContextQueue(
   entryId: string,
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): boolean {
-  try {
-    if (!existsSync(queueFile)) return false;
-    const d = JSON.parse(readFileSync(queueFile, "utf8"));
-    const queue = Array.isArray(d) ? d : [d];
-    const remaining = queue.filter(
-      (entry: any) => !(entry.id === entryId)
-    );
-    if (remaining.length === queue.length) return false;
-    writeFileSync(queueFile, JSON.stringify(remaining));
-    return true;
-  } catch (err: any) {
-    log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
-    return false;
-  }
+  return (
+    withQueueLock(queueFile, () => {
+      try {
+        if (!existsSync(queueFile)) return false;
+        const d = JSON.parse(readFileSync(queueFile, "utf8"));
+        const queue = Array.isArray(d) ? d : [d];
+        const remaining = queue.filter(
+          (entry: any) => !(entry.id === entryId)
+        );
+        if (remaining.length === queue.length) return false;
+        writeFileSync(queueFile, JSON.stringify(remaining));
+        return true;
+      } catch (err: any) {
+        log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
+        return false;
+      }
+    }) ?? false
+  );
 }
 
 function shellEscape(s: string): string {

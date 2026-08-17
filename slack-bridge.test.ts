@@ -319,6 +319,26 @@ describe("crash-recovery watermark guard (#4984)", () => {
     }
   });
 
+  test("appendReplyContextQueue fails closed when the queue lock is held", () => {
+    const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
+    const lockFile = `${queueFile}.lock`;
+    const originalTimeout = process.env.BRIDGE_REPLY_CONTEXT_LOCK_TIMEOUT_MS;
+    process.env.BRIDGE_REPLY_CONTEXT_LOCK_TIMEOUT_MS = "80";
+    try {
+      writeFileSync(lockFile, "");
+      expect(appendReplyContextQueue("C0QUEUE", "700.002", "700.013", queueFile)).toBeNull();
+      expect(existsSync(queueFile)).toBe(false);
+    } finally {
+      if (originalTimeout === undefined) {
+        delete process.env.BRIDGE_REPLY_CONTEXT_LOCK_TIMEOUT_MS;
+      } else {
+        process.env.BRIDGE_REPLY_CONTEXT_LOCK_TIMEOUT_MS = originalTimeout;
+      }
+      if (existsSync(lockFile)) unlinkSync(lockFile);
+      if (existsSync(queueFile)) unlinkSync(queueFile);
+    }
+  });
+
   test("recordMessage atomically claims a (channel, ts) exactly once", () => {
     const ch = channelId();
     const first = recordMessage({
