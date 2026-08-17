@@ -48,27 +48,48 @@ import json, sys, os
 
 PENDING_FILE = '/tmp/slack-bridge-last-inject.json'
 
-# Load pending context from FIFO queue (pop oldest entry)
+# Load pending context from FIFO queue (pop oldest entry) under the same
+# exclusive lock the bridge uses for append/remove, so a concurrent Stop hook
+# cannot read the same head twice or overwrite a newer queue update.
 try:
-    raw = json.load(open(PENDING_FILE))
-    # Support both old format (single object) and new format (array queue)
-    if isinstance(raw, list):
-        if len(raw) == 0:
-            os.remove(PENDING_FILE)
-            sys.exit(1)
-        ctx = raw.pop(0)  # Pop oldest
-        # Write remaining queue back (or delete if empty)
-        if raw:
-            with open(PENDING_FILE, 'w') as f:
-                json.dump(raw, f)
-        else:
-            os.remove(PENDING_FILE)
-    else:
-        ctx = raw  # Legacy single-object format
-    channel = ctx.get('channel', '')
-    thread_ts = ctx.get('thread_ts', '')
-    if not channel or not thread_ts:
+    import time
+    LOCK_FILE = PENDING_FILE + '.lock'
+    deadline = time.time() + 1.5
+    lock_fd = None
+    while time.time() < deadline:
+        try:
+            lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            time.sleep(0.025)
+    if lock_fd is None:
         sys.exit(1)
+    try:
+        raw = json.load(open(PENDING_FILE))
+        # Support both old format (single object) and new format (array queue)
+        if isinstance(raw, list):
+            if len(raw) == 0:
+                os.remove(PENDING_FILE)
+                sys.exit(1)
+            ctx = raw.pop(0)  # Pop oldest
+            # Write remaining queue back (or delete if empty)
+            if raw:
+                with open(PENDING_FILE, 'w') as f:
+                    json.dump(raw, f)
+            else:
+                os.remove(PENDING_FILE)
+        else:
+            ctx = raw  # Legacy single-object format
+        channel = ctx.get('channel', '')
+        thread_ts = ctx.get('thread_ts', '')
+        if not channel or not thread_ts:
+            sys.exit(1)
+    finally:
+        os.close(lock_fd)
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
 except Exception:
     sys.exit(1)
 
