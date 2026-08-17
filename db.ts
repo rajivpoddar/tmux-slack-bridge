@@ -223,7 +223,30 @@ export function recordOutboundMessage(params: {
     )
     .get(params.channelId, params.ts);
   if (!existing) return false;
-  if (existing.direction === "outbound") return true;
+  if (existing.direction === "outbound") {
+    const row = db
+      .prepare(
+        `SELECT channel_type, thread_ts, user_id, user_name, body
+         FROM messages WHERE channel_id = ? AND ts = ? LIMIT 1`
+      )
+      .get(params.channelId, params.ts) as
+      | {
+          channel_type: string;
+          thread_ts: string | null;
+          user_id: string;
+          user_name: string;
+          body: string;
+        }
+      | undefined;
+    if (!row) return false;
+    return (
+      row.channel_type === params.channelType &&
+      (row.thread_ts ?? null) === (params.threadTs ?? null) &&
+      row.user_id === params.userId &&
+      row.user_name === params.userName &&
+      row.body === params.body
+    );
+  }
   // A concurrent inbound/poll handler recorded the same Slack message first.
   // Promote it to the verified outbound record atomically; the inbound claim
   // cannot win this update after the row was already persisted.

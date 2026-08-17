@@ -152,6 +152,31 @@ describe("verified outbound Slack recording", () => {
     expect(countRows(text)).toBe(2);
   });
 
+  test("same identity with mismatched outbound fields fails closed", () => {
+    const text = "bridge obligation 752 mismatch replay";
+    const ts = "1787000000.000203";
+    const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };
+    expect(
+      persistVerifiedOutboundSlackMessage(payload, {
+        ok: true,
+        channel: "C0OUTBOUND",
+        ts,
+      })
+    ).toBe(true);
+
+    expect(
+      persistVerifiedOutboundSlackMessage(
+        { ...payload, thread_ts: "1786941665.999999" },
+        {
+          ok: true,
+          channel: "C0OUTBOUND",
+          ts,
+        }
+      )
+    ).toBe(false);
+    expect(countRows(text)).toBe(1);
+  });
+
   test("existing inbound row with the same identity is normalized to outbound", () => {
     const text = "bridge obligation 752 inbound-promoted";
     const ts = "1787000000.000202";
