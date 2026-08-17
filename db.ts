@@ -50,7 +50,6 @@ export function getDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
-    CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction);
 
     CREATE TABLE IF NOT EXISTS threads (
       thread_ts TEXT NOT NULL,
@@ -79,6 +78,22 @@ export function getDb(): Database.Database {
       PRIMARY KEY (channel_id, thread_ts)
     );
   `);
+
+  // Legacy databases predate the direction column; migrate before any index
+  // or outbound write touches it.
+  const messageColumns = _db.prepare("PRAGMA table_info(messages)").all() as Array<{
+    name: string;
+  }>;
+  if (!messageColumns.some((column) => column.name === "direction")) {
+    _db.exec(`
+      ALTER TABLE messages
+      ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
+        CHECK(direction IN ('inbound', 'outbound'))
+    `);
+  }
+  _db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)"
+  );
 
   // Dedup migration (2026-08-11 duplicate-injection fix): older databases
   // predate the unique (channel_id, ts) contract and contain duplicate rows

@@ -35,7 +35,6 @@ describe("legacy duplicate-row migration", () => {
         channel_type TEXT NOT NULL CHECK(channel_type IN ('dm', 'channel', 'mention')),
         user_id TEXT NOT NULL,
         user_name TEXT NOT NULL,
-        direction TEXT NOT NULL DEFAULT 'inbound' CHECK(direction IN ('inbound', 'outbound')),
         body TEXT NOT NULL,
         has_images INTEGER NOT NULL DEFAULT 0,
         has_snippets INTEGER NOT NULL DEFAULT 0,
@@ -148,5 +147,18 @@ describe("legacy duplicate-row migration", () => {
       .get("600.001", "C0DEDUP") as { message_count: number } | undefined;
     expect(row).toBeTruthy();
     expect(row!.message_count).toBe(1);
+  });
+
+  test("legacy schema without direction column is migrated before indexes", () => {
+    const columns = getDb().prepare("PRAGMA table_info(messages)").all() as Array<{
+      name: string;
+    }>;
+    expect(columns.some((column) => column.name === "direction")).toBe(true);
+    const index = getDb()
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_direction'"
+      )
+      .get();
+    expect(index).toBeTruthy();
   });
 });
