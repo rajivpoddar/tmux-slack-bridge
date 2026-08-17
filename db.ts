@@ -220,21 +220,22 @@ export function recordOutboundMessage(params: {
   body: string;
 }): boolean {
   const db = getDb();
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO messages
-      (ts, thread_ts, channel_id, channel_type, user_id, user_name, direction, body, has_images, has_snippets)
-    VALUES (?, ?, ?, ?, ?, ?, 'outbound', ?, 0, 0)
-  `).run(
-    params.ts,
-    params.threadTs,
-    params.channelId,
-    params.channelType,
-    params.userId,
-    params.userName,
-    params.body
-  );
+  const insertOutbound = db.transaction((): boolean => {
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO messages
+        (ts, thread_ts, channel_id, channel_type, user_id, user_name, direction, body, has_images, has_snippets)
+      VALUES (?, ?, ?, ?, ?, ?, 'outbound', ?, 0, 0)
+    `).run(
+      params.ts,
+      params.threadTs,
+      params.channelId,
+      params.channelType,
+      params.userId,
+      params.userName,
+      params.body
+    );
 
-  if (insert.changes === 1) {
+    if (insert.changes !== 1) return false;
     const effectiveThreadTs = params.threadTs || params.ts;
     const existing = db.prepare(
       "SELECT message_count FROM threads WHERE thread_ts = ? AND channel_id = ?"
@@ -260,7 +261,8 @@ export function recordOutboundMessage(params: {
       );
     }
     return true;
-  }
+  });
+  if (insertOutbound()) return true;
   // Idempotent replay of the same Slack message identity is still a verified
   // success when the existing row is already the normalized outbound record.
   const existing = db
