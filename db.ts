@@ -79,58 +79,63 @@ export function getDb(): Database.Database {
     );
   `);
 
-  // Legacy databases predate the direction column; migrate before any index
-  // or outbound write touches it.
-  const messageColumns = _db.prepare("PRAGMA table_info(messages)").all() as Array<{
-    name: string;
-  }>;
-  if (!messageColumns.some((column) => column.name === "direction")) {
-    _db.exec(`
-      ALTER TABLE messages
-      ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
-        CHECK(direction IN ('inbound', 'outbound'))
-    `);
-  }
-  _db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)"
-  );
-
-  // Dedup migration (2026-08-11 duplicate-injection fix): older databases
-  // predate the unique (channel_id, ts) contract and contain duplicate rows
-  // written by the check-then-insert race (socket vs poll / dual instances).
-  // Keep the earliest row per (channel_id, ts), then enforce uniqueness so
-  // `INSERT OR IGNORE` can act as the atomic claim going forward.
-  const duplicateRows = _db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM (
-         SELECT 1 FROM messages GROUP BY channel_id, ts HAVING COUNT(*) > 1
-       )`
-    )
-    .get() as { c: number };
-  if (duplicateRows.c > 0) {
-    const removed = _db
-      .prepare(
-        `DELETE FROM messages
-         WHERE id NOT IN (SELECT MIN(id) FROM messages GROUP BY channel_id, ts)`
-      )
-      .run();
-    console.warn(
-      `[db] dedup migration removed ${removed.changes} duplicate message row(s)`
+  // All legacy migrations run as one transaction so an interruption cannot
+  // expose a partially migrated schema, partial dedup, or stale thread counts.
+  const migrateLegacy = _db.transaction(() => {
+    // Legacy databases predate the direction column; migrate before any index
+    // or outbound write touches it.
+    const messageColumns = _db.prepare("PRAGMA table_info(messages)").all() as Array<{
+      name: string;
+    }>;
+    if (!messageColumns.some((column) => column.name === "direction")) {
+      _db.exec(`
+        ALTER TABLE messages
+        ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'
+          CHECK(direction IN ('inbound', 'outbound'))
+      `);
+    }
+    _db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)"
     );
-    // Recompute thread counts from the surviving message rows so the
-    // message_count metadata cannot retain a pre-dedup inflated value.
-    _db.prepare(`
-      UPDATE threads
-      SET message_count = (
-        SELECT COUNT(*) FROM messages m
-        WHERE m.channel_id = threads.channel_id
-          AND COALESCE(m.thread_ts, m.ts) = threads.thread_ts
+
+    // Dedup migration (2026-08-11 duplicate-injection fix): older databases
+    // predate the unique (channel_id, ts) contract and contain duplicate rows
+    // written by the check-then-insert race (socket vs poll / dual instances).
+    // Keep the earliest row per (channel_id, ts), then enforce uniqueness so
+    // `INSERT OR IGNORE` can act as the atomic claim going forward.
+    const duplicateRows = _db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 FROM messages GROUP BY channel_id, ts HAVING COUNT(*) > 1
+         )`
       )
-    `).run();
-  }
-  _db.exec(
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_channel_ts ON messages(channel_id, ts)"
-  );
+      .get() as { c: number };
+    if (duplicateRows.c > 0) {
+      const removed = _db
+        .prepare(
+          `DELETE FROM messages
+           WHERE id NOT IN (SELECT MIN(id) FROM messages GROUP BY channel_id, ts)`
+        )
+        .run();
+      console.warn(
+        `[db] dedup migration removed ${removed.changes} duplicate message row(s)`
+      );
+      // Recompute thread counts from the surviving message rows so the
+      // message_count metadata cannot retain a pre-dedup inflated value.
+      _db.prepare(`
+        UPDATE threads
+        SET message_count = (
+          SELECT COUNT(*) FROM messages m
+          WHERE m.channel_id = threads.channel_id
+            AND COALESCE(m.thread_ts, m.ts) = threads.thread_ts
+        )
+      `).run();
+    }
+    _db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_channel_ts ON messages(channel_id, ts)"
+    );
+  });
+  migrateLegacy();
 
   return _db;
 }
@@ -229,7 +234,33 @@ export function recordOutboundMessage(params: {
     params.body
   );
 
-  if (insert.changes === 1) return true;
+  if (insert.changes === 1) {
+    const effectiveThreadTs = params.threadTs || params.ts;
+    const existing = db.prepare(
+      "SELECT message_count FROM threads WHERE thread_ts = ? AND channel_id = ?"
+    ).get(effectiveThreadTs, params.channelId) as { message_count: number } | undefined;
+    if (existing) {
+      db.prepare(`
+        UPDATE threads
+        SET message_count = message_count + 1,
+            last_activity = datetime('now'),
+            status = 'active'
+        WHERE thread_ts = ? AND channel_id = ?
+      `).run(effectiveThreadTs, params.channelId);
+    } else {
+      db.prepare(`
+        INSERT INTO threads (thread_ts, channel_id, started_by, started_by_name, first_message, message_count)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `).run(
+        effectiveThreadTs,
+        params.channelId,
+        params.userId,
+        params.userName,
+        params.body.slice(0, 200)
+      );
+    }
+    return true;
+  }
   // Idempotent replay of the same Slack message identity is still a verified
   // success when the existing row is already the normalized outbound record.
   const existing = db

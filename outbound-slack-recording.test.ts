@@ -98,6 +98,30 @@ describe("verified outbound Slack recording", () => {
     );
   });
 
+  test("fresh outbound insert keeps thread message_count consistent", () => {
+    const text = "bridge obligation 752 thread count";
+    const ts = "1787000000.000005";
+    const threadTs = "1786941665.403559";
+    expect(
+      persistVerifiedOutboundSlackMessage(
+        { channel: "C0OUTBOUND", thread_ts: threadTs, text },
+        {
+          ok: true,
+          channel: "C0OUTBOUND",
+          ts,
+          thread_ts: threadTs,
+        }
+      )
+    ).toBe(true);
+    const row = getDb()
+      .prepare(
+        "SELECT message_count FROM threads WHERE thread_ts = ? AND channel_id = ?"
+      )
+      .get(threadTs, "C0OUTBOUND") as { message_count: number } | undefined;
+    expect(row).toBeTruthy();
+    expect(row!.message_count).toBeGreaterThan(0);
+  });
+
   test("failed Slack send persists zero rows", () => {
     const text = "bridge obligation 752 failed send must not persist";
     const persisted = persistVerifiedOutboundSlackMessage(
