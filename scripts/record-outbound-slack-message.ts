@@ -113,10 +113,11 @@ if (import.meta.url === invokedPath) {
 
   if (parsed) {
     try {
-      persistVerifiedOutboundSlackMessage(
+      const persisted = persistVerifiedOutboundSlackMessage(
         parsed.payload as SlackPostPayload,
         parsed.response as SlackPostResponse
       );
+      if (!persisted) process.exit(2);
     } finally {
       closeDb();
     }

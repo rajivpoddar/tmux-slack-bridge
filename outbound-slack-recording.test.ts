@@ -317,7 +317,7 @@ describe("verified outbound Slack recording", () => {
     expect(hook).toContain("scripts/post-and-record-slack-reply.ts");
     expect(hook).toContain("PENDING_FILE + '.lock'");
     expect(hook).toContain("'id', 'channel', 'thread_ts', 'ts'");
-    expect(hook).toContain("reply_ok_seen");
+    expect(hook).toContain("record_verified_payload");
     expect(hook).not.toContain("curl ");
     expect(hook).not.toContain("Authorization: Bearer");
     expect(hook).not.toContain("SLACK_TOKEN");

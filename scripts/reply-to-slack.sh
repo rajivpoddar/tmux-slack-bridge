@@ -139,11 +139,44 @@ try:
         with open(PENDING_FILE, 'w') as f:
             json.dump(queue, f)
 
+    bridge_dir = os.path.expanduser('~/Downloads/projects/tmux-slack-bridge')
+    npx_candidate = os.path.expanduser('~/.nvm/versions/node/v22.13.1/bin/npx')
+    npx_bin = npx_candidate if os.path.isfile(npx_candidate) and os.access(npx_candidate, os.X_OK) else 'npx'
+
+    def record_verified_payload(payload, response_text):
+        try:
+            response = json.loads(response_text)
+        except Exception:
+            return False
+        if not isinstance(response, dict) or response.get('ok') is not True:
+            return False
+        resp_channel = response.get('channel')
+        msg = response.get('message') if isinstance(response.get('message'), dict) else {}
+        resp_thread = response.get('thread_ts') or msg.get('thread_ts')
+        resp_ts = response.get('ts') or msg.get('ts')
+        if (
+            resp_channel != payload.get('channel')
+            or resp_thread != payload.get('thread_ts')
+            or not isinstance(resp_ts, str)
+            or not resp_ts
+        ):
+            return False
+        try:
+            proc = subprocess.run(
+                [npx_bin, '--no-install', 'tsx', 'scripts/record-outbound-slack-message.ts'],
+                input=json.dumps(payload) + '\n' + json.dumps(response),
+                capture_output=True, text=True, timeout=60,
+                cwd=bridge_dir, env=os.environ.copy()
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     # Already replied via MCP or direct API this turn? Only commit removal
     # after a verified Slack success receipt; otherwise restore the owned
     # entry so the claimed inbound message keeps its reply target.
-    replied_tool_ids = set()
-    reply_ok_seen = False
+    replied_tool_inputs = {}
+    replied_tool_results = {}
     for line in lines[-50:]:
         try:
             obj = json.loads(line.strip())
@@ -159,14 +192,14 @@ try:
                 if 'add_message' in tool_name or 'send_message' in tool_name:
                     if owned_target:
                         if isinstance(block.get('id'), str):
-                            replied_tool_ids.add(block['id'])
+                            replied_tool_inputs[block['id']] = tool_input
                 elif tool_name == 'Bash':
                     cmd = input_text
                     if 'chat.postMessage' in cmd and owned_target:
                         if isinstance(block.get('id'), str):
-                            replied_tool_ids.add(block['id'])
+                            replied_tool_inputs[block['id']] = tool_input
             elif block.get('type') == 'tool_result':
-                if block.get('tool_use_id') not in replied_tool_ids:
+                if block.get('tool_use_id') not in replied_tool_inputs:
                     continue
                 content = block.get('content')
                 candidates = []
@@ -190,7 +223,7 @@ try:
                                 and isinstance(resp_ts, str)
                                 and bool(resp_ts)
                             ):
-                                reply_ok_seen = True
+                                replied_tool_results[block['tool_use_id']] = candidate
                                 break
                     except Exception:
                         pass
@@ -202,14 +235,43 @@ try:
                         and f'"thread_ts":"{thread_ts}"' in compact
                         and bool(ts_match and ts_match.group(1))
                     ):
-                        reply_ok_seen = True
+                        replied_tool_results[block['tool_use_id']] = candidate
                         break
-    if replied_tool_ids:
-        if reply_ok_seen:
-            commit_removal()
-            sys.exit(0)
-        restore_owned()
-        sys.exit(1)
+    for tool_id, raw_input in replied_tool_inputs.items():
+        response_text = replied_tool_results.get(tool_id)
+        if not response_text:
+            restore_owned()
+            sys.exit(1)
+        payload = raw_input if isinstance(raw_input, dict) else None
+        if payload is None and isinstance(raw_input, str):
+            try:
+                payload = json.loads(raw_input)
+            except Exception:
+                payload = None
+        if payload is None and isinstance(raw_input, str):
+            start = raw_input.find('{')
+            end = raw_input.rfind('}')
+            if start >= 0 and end > start:
+                try:
+                    payload = json.loads(raw_input[start:end + 1])
+                except Exception:
+                    payload = None
+        if (
+            payload is None
+            or not isinstance(payload.get('channel'), str)
+            or payload.get('channel') != channel
+            or payload.get('thread_ts') != thread_ts
+            or not isinstance(payload.get('text'), str)
+            or not payload.get('text')
+        ):
+            restore_owned()
+            sys.exit(1)
+        if not record_verified_payload(payload, response_text):
+            restore_owned()
+            sys.exit(1)
+    if replied_tool_inputs:
+        commit_removal()
+        sys.exit(0)
 
     last_text = ''
     for line in lines:
@@ -246,9 +308,6 @@ try:
         'text': converted_text[:3000],
     }
 
-    bridge_dir = os.path.expanduser('~/Downloads/projects/tmux-slack-bridge')
-    npx_candidate = os.path.expanduser('~/.nvm/versions/node/v22.13.1/bin/npx')
-    npx_bin = npx_candidate if os.path.isfile(npx_candidate) and os.access(npx_candidate, os.X_OK) else 'npx'
     try:
         proc = subprocess.run(
             [npx_bin, '--no-install', 'tsx', 'scripts/post-and-record-slack-reply.ts'],
