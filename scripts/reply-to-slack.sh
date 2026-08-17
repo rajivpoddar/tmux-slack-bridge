@@ -166,8 +166,10 @@ BRIDGE_DIR="$HOME/Downloads/projects/tmux-slack-bridge"
 if [ -d "$BRIDGE_DIR" ]; then
   (
     cd "$BRIDGE_DIR" || exit 0
+    NPX_BIN="${BRIDGE_NPX_BIN:-$HOME/.nvm/versions/node/v22.13.1/bin/npx}"
+    [ -x "$NPX_BIN" ] || NPX_BIN="npx"
     printf '%s' "$SLACK_PAYLOAD" \
-      | npx --no-install tsx scripts/post-and-record-slack-reply.ts
+      | "$NPX_BIN" --no-install tsx scripts/post-and-record-slack-reply.ts
   ) >/dev/null 2>&1 || true
 fi
 
