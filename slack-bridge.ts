@@ -162,16 +162,12 @@ export function appendReplyContextQueue(
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): string | null {
   try {
-    const queue = existsSync(queueFile)
-      ? (() => {
-          try {
-            const d = JSON.parse(readFileSync(queueFile, "utf8"));
-            return Array.isArray(d) ? d : [d];
-          } catch {
-            return [];
-          }
-        })()
-      : [];
+    let queue: unknown[] = [];
+    if (existsSync(queueFile)) {
+      const d = JSON.parse(readFileSync(queueFile, "utf8"));
+      if (d === null || typeof d !== "object") return null;
+      queue = Array.isArray(d) ? d : [d];
+    }
     const entryId = randomUUID();
     queue.push({ id: entryId, channel, thread_ts: threadTs, ts });
     writeFileSync(queueFile, JSON.stringify(queue));

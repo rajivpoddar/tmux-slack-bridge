@@ -11,7 +11,7 @@
  * are processed (not skipped by watermark).
  */
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -305,6 +305,17 @@ describe("crash-recovery watermark guard (#4984)", () => {
       expect(appendReplyContextQueue("C0QUEUE", "700.002", "700.011", queueDir)).toBeNull();
     } finally {
       rmSync(queueDir, { recursive: true, force: true });
+    }
+  });
+
+  test("appendReplyContextQueue fails closed on malformed existing queue", () => {
+    const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
+    try {
+      writeFileSync(queueFile, "{not-json");
+      expect(appendReplyContextQueue("C0QUEUE", "700.002", "700.012", queueFile)).toBeNull();
+      expect(readFileSync(queueFile, "utf8")).toBe("{not-json");
+    } finally {
+      if (existsSync(queueFile)) unlinkSync(queueFile);
     }
   });
 
