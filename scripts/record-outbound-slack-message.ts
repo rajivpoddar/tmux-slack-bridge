@@ -13,10 +13,12 @@ export type SlackPostResponse = {
   ok?: unknown;
   channel?: unknown;
   ts?: unknown;
+  thread_ts?: unknown;
   message?: {
     user?: unknown;
     bot_id?: unknown;
     username?: unknown;
+    thread_ts?: unknown;
   };
 };
 
@@ -42,16 +44,21 @@ export function outboundRecordFromSlackPost(
   if (typeof response.ts !== "string" || response.ts.length === 0) return null;
   if (typeof payload.text !== "string" || payload.text.trim().length === 0) return null;
 
-  const channel =
-    typeof response.channel === "string" && response.channel.length > 0
-      ? response.channel
-      : payload.channel;
+  const channel = response.channel;
   if (typeof channel !== "string" || channel.length === 0) return null;
+  if (payload.channel !== channel) return null;
 
   const threadTs =
     typeof payload.thread_ts === "string" && payload.thread_ts.length > 0
       ? payload.thread_ts
       : null;
+  const responseThreadTs =
+    typeof response.thread_ts === "string" && response.thread_ts.length > 0
+      ? response.thread_ts
+      : typeof response.message?.thread_ts === "string" && response.message.thread_ts.length > 0
+        ? response.message.thread_ts
+        : null;
+  if ((threadTs ?? null) !== (responseThreadTs ?? null)) return null;
 
   const userId =
     typeof response.message?.user === "string" && response.message.user.length > 0

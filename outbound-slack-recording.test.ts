@@ -55,6 +55,7 @@ describe("verified outbound Slack recording", () => {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000001",
+        thread_ts: "1786941665.403559",
         message: { user: "U0BRIDGE", username: "Bridge Bot" },
       }
     );
@@ -119,6 +120,37 @@ describe("verified outbound Slack recording", () => {
     expect(countRows(text)).toBe(0);
   });
 
+  test("mismatched response channel persists zero rows", () => {
+    const text = "bridge obligation 752 wrong channel";
+    const persisted = persistVerifiedOutboundSlackMessage(
+      { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text },
+      {
+        ok: true,
+        channel: "C0OTHER",
+        ts: "1787000000.000098",
+      }
+    );
+
+    expect(persisted).toBe(false);
+    expect(countRows(text)).toBe(0);
+  });
+
+  test("mismatched response thread persists zero rows", () => {
+    const text = "bridge obligation 752 wrong thread";
+    const persisted = persistVerifiedOutboundSlackMessage(
+      { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text },
+      {
+        ok: true,
+        channel: "C0OUTBOUND",
+        ts: "1787000000.000097",
+        message: { user: "U0BRIDGE", thread_ts: "1786941665.999999" },
+      }
+    );
+
+    expect(persisted).toBe(false);
+    expect(countRows(text)).toBe(0);
+  });
+
   test("same Slack message identity is idempotent; distinct sends persist", () => {
     const text = "bridge obligation 752 idempotent replay";
     const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };
@@ -128,6 +160,7 @@ describe("verified outbound Slack recording", () => {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000200",
+        thread_ts: "1786941665.403559",
       })
     ).toBe(true);
     // Replaying the exact same Slack message (same channel/ts) is idempotent:
@@ -137,6 +170,7 @@ describe("verified outbound Slack recording", () => {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000200",
+        thread_ts: "1786941665.403559",
       })
     ).toBe(true);
     // A distinct Slack message with the same body is a different message and
@@ -146,6 +180,7 @@ describe("verified outbound Slack recording", () => {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000201",
+        thread_ts: "1786941665.403559",
       })
     ).toBe(true);
 
@@ -161,6 +196,7 @@ describe("verified outbound Slack recording", () => {
         ok: true,
         channel: "C0OUTBOUND",
         ts,
+        thread_ts: "1786941665.403559",
       })
     ).toBe(true);
 
@@ -168,9 +204,10 @@ describe("verified outbound Slack recording", () => {
       persistVerifiedOutboundSlackMessage(
         { ...payload, thread_ts: "1786941665.999999" },
         {
-          ok: true,
-          channel: "C0OUTBOUND",
-          ts,
+        ok: true,
+        channel: "C0OUTBOUND",
+        ts,
+        thread_ts: "1786941665.403559",
         }
       )
     ).toBe(false);
@@ -203,6 +240,7 @@ describe("verified outbound Slack recording", () => {
           ok: true,
           channel: "C0OUTBOUND",
           ts,
+          thread_ts: "1786941665.403559",
           message: { user: "U0BRIDGE", username: "Bridge Bot" },
         }
       )
@@ -267,6 +305,7 @@ describe("verified outbound Slack recording", () => {
       ok: true,
       channel: "C0OUTBOUND",
       ts: "1787000000.000300",
+      thread_ts: "1786941665.403559",
     });
 
     try {
@@ -308,6 +347,7 @@ describe("verified outbound Slack recording", () => {
           ok: true,
           channel: "C0OUTBOUND",
           ts: "1787000000.000400",
+          thread_ts: "1786941665.403559",
         }),
       } as Response;
     }) as typeof fetch;
