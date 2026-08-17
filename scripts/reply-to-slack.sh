@@ -139,23 +139,34 @@ try:
         with open(PENDING_FILE, 'w') as f:
             json.dump(queue, f)
 
-    # Already replied via MCP or direct API this turn?
+    # Already replied via MCP or direct API this turn? Only commit removal
+    # after a verified Slack success receipt; otherwise restore the owned
+    # entry so the claimed inbound message keeps its reply target.
+    replied_tool_seen = False
+    reply_ok_seen = False
     for line in lines[-50:]:
+        raw_line = line.strip()
+        if '"ok": true' in raw_line or '"ok":true' in raw_line:
+            reply_ok_seen = True
         try:
             obj = json.loads(line.strip())
             for block in obj.get('message', {}).get('content', []):
                 if block.get('type') == 'tool_use':
                     tool_name = block.get('name', '')
                     if 'add_message' in tool_name or 'send_message' in tool_name:
-                        commit_removal()
-                        sys.exit(0)
-                    if tool_name == 'Bash':
+                        replied_tool_seen = True
+                    elif tool_name == 'Bash':
                         cmd = block.get('input', {}).get('command', '')
                         if 'chat.postMessage' in cmd and thread_ts in cmd:
-                            commit_removal()
-                            sys.exit(0)
+                            replied_tool_seen = True
         except Exception:
             pass
+    if replied_tool_seen:
+        if reply_ok_seen:
+            commit_removal()
+            sys.exit(0)
+        restore_owned()
+        sys.exit(1)
 
     last_text = ''
     for line in lines:
