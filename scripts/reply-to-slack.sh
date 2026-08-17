@@ -66,11 +66,30 @@ except Exception:
 LOCK_FILE = PENDING_FILE + '.lock'
 deadline = time.time() + 1.5
 lock_fd = None
+def owner_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 while time.time() < deadline:
     try:
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(lock_fd, str(os.getpid()).encode())
         break
     except FileExistsError:
+        try:
+            with open(LOCK_FILE) as f:
+                owner = int((f.read().strip() or '0'))
+            if owner > 0 and not owner_alive(owner):
+                os.remove(LOCK_FILE)
+                continue
+        except (ValueError, OSError):
+            pass
         time.sleep(0.025)
 if lock_fd is None:
     sys.exit(1)

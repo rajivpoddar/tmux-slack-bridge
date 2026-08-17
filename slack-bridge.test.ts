@@ -339,6 +339,21 @@ describe("crash-recovery watermark guard (#4984)", () => {
     }
   });
 
+  test("appendReplyContextQueue reclaims a stale lock from a dead owner", () => {
+    const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
+    const lockFile = `${queueFile}.lock`;
+    try {
+      // macOS PIDs are bounded well below 999999, so this is provably dead.
+      writeFileSync(lockFile, "999999");
+      const entryId = appendReplyContextQueue("C0QUEUE", "700.002", "700.014", queueFile);
+      expect(typeof entryId).toBe("string");
+      expect(existsSync(lockFile)).toBe(false);
+    } finally {
+      if (existsSync(lockFile)) unlinkSync(lockFile);
+      if (existsSync(queueFile)) unlinkSync(queueFile);
+    }
+  });
+
   test("recordMessage atomically claims a (channel, ts) exactly once", () => {
     const ch = channelId();
     const first = recordMessage({

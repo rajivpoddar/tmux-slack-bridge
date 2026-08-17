@@ -174,11 +174,21 @@ function withQueueLock<T>(
   while (Date.now() < deadline) {
     try {
       fd = openSync(lockPath, "wx");
+      writeFileSync(lockPath, String(process.pid));
       break;
     } catch (error: any) {
       if (error?.code !== "EEXIST") {
         log(`⚠️ Failed to acquire Slack reply context queue lock: ${error?.message || error}`);
         return null;
+      }
+      try {
+        const owner = Number(readFileSync(lockPath, "utf8").trim());
+        if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        // Unreadable lock contents cannot prove the owner is dead.
       }
       sleepSync(25);
     }
@@ -196,6 +206,15 @@ function withQueueLock<T>(
     } catch {
       // Lock cleanup is best-effort; a stale lock times out on the next writer.
     }
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === "EPERM";
   }
 }
 
