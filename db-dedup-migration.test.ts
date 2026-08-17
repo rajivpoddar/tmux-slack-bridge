@@ -41,6 +41,20 @@ describe("legacy duplicate-row migration", () => {
         has_snippets INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      CREATE TABLE IF NOT EXISTS threads (
+        thread_ts TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        topic TEXT,
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved', 'stale')),
+        started_by TEXT,
+        started_by_name TEXT,
+        first_message TEXT,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        last_activity TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (thread_ts, channel_id)
+      );
     `);
     raw
       .prepare(
@@ -60,6 +74,12 @@ describe("legacy duplicate-row migration", () => {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run("600.001", null, "C0DEDUP", "channel", "U0TEST", "Tester", "dup-c", 0, 0);
+    raw
+      .prepare(
+        `INSERT INTO threads (thread_ts, channel_id, started_by, started_by_name, first_message, message_count)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run("600.001", "C0DEDUP", "U0TEST", "Tester", "dup-a", 3);
     raw.close();
 
     const dbModule = await import("./db.ts");
@@ -118,5 +138,15 @@ describe("legacy duplicate-row migration", () => {
     });
     expect(first).toBe(true);
     expect(replayed).toBe(false);
+  });
+
+  test("dedup migration recomputes thread message_count from surviving rows", () => {
+    const row = getDb()
+      .prepare(
+        "SELECT message_count FROM threads WHERE thread_ts = ? AND channel_id = ?"
+      )
+      .get("600.001", "C0DEDUP") as { message_count: number } | undefined;
+    expect(row).toBeTruthy();
+    expect(row!.message_count).toBe(1);
   });
 });

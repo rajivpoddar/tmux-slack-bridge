@@ -102,6 +102,16 @@ export function getDb(): Database.Database {
     console.warn(
       `[db] dedup migration removed ${removed.changes} duplicate message row(s)`
     );
+    // Recompute thread counts from the surviving message rows so the
+    // message_count metadata cannot retain a pre-dedup inflated value.
+    _db.prepare(`
+      UPDATE threads
+      SET message_count = (
+        SELECT COUNT(*) FROM messages m
+        WHERE m.channel_id = threads.channel_id
+          AND COALESCE(m.thread_ts, m.ts) = threads.thread_ts
+      )
+    `).run();
   }
   _db.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_channel_ts ON messages(channel_id, ts)"
