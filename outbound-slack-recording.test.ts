@@ -117,7 +117,7 @@ describe("verified outbound Slack recording", () => {
     expect(countRows(text)).toBe(0);
   });
 
-  test("retrying the exact same outbound message does not duplicate rows", () => {
+  test("same Slack message identity is idempotent; distinct sends persist", () => {
     const text = "bridge obligation 752 idempotent replay";
     const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };
 
@@ -128,6 +128,7 @@ describe("verified outbound Slack recording", () => {
         ts: "1787000000.000200",
       })
     ).toBe(true);
+    // Replaying the exact same Slack message (same channel/ts) must not insert.
     expect(
       persistVerifiedOutboundSlackMessage(payload, {
         ok: true,
@@ -135,15 +136,17 @@ describe("verified outbound Slack recording", () => {
         ts: "1787000000.000200",
       })
     ).toBe(false);
+    // A distinct Slack message with the same body is a different message and
+    // must not be suppressed by a body-based delivery key.
     expect(
       persistVerifiedOutboundSlackMessage(payload, {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000201",
       })
-    ).toBe(false);
+    ).toBe(true);
 
-    expect(countRows(text)).toBe(1);
+    expect(countRows(text)).toBe(2);
   });
 
   test("CLI records from stdin without payload or response environment variables", () => {

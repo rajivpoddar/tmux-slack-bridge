@@ -107,38 +107,6 @@ export function getDb(): Database.Database {
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_channel_ts ON messages(channel_id, ts)"
   );
 
-  const duplicateOutboundRows = _db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM (
-         SELECT 1 FROM messages
-         WHERE direction = 'outbound'
-         GROUP BY channel_id, COALESCE(thread_ts, ''), body
-         HAVING COUNT(*) > 1
-       )`
-    )
-    .get() as { c: number };
-  if (duplicateOutboundRows.c > 0) {
-    const removed = _db
-      .prepare(
-        `DELETE FROM messages
-         WHERE direction = 'outbound'
-           AND id NOT IN (
-             SELECT MIN(id) FROM messages
-             WHERE direction = 'outbound'
-             GROUP BY channel_id, COALESCE(thread_ts, ''), body
-           )`
-      )
-      .run();
-    console.warn(
-      `[db] outbound dedup migration removed ${removed.changes} duplicate message row(s)`
-    );
-  }
-  _db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_outbound_delivery_key
-    ON messages(channel_id, COALESCE(thread_ts, ''), body)
-    WHERE direction = 'outbound'
-  `);
-
   return _db;
 }
 
