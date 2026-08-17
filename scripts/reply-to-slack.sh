@@ -43,7 +43,7 @@ JSONL="$HOME/.claude/projects/-${PROJECT_DIR_NAME}/${SESSION_ID}.jsonl"
 # Doing this in one Python call avoids shell escaping issues with message text.
 export SESSION_ID CWD
 
-CURL_PAYLOAD=$(python3 - <<'PYEOF'
+SLACK_PAYLOAD=$(python3 - <<'PYEOF'
 import json, sys, os
 
 PENDING_FILE = '/tmp/slack-bridge-last-inject.json'
@@ -90,7 +90,7 @@ except Exception:
 
 # Check if this turn already replied to Slack via ANY mechanism:
 # 1. MCP conversations_add_message tool call
-# 2. Bash tool call containing curl chat.postMessage (direct API posts)
+# 2. Bash tool call containing chat.postMessage (direct API posts)
 # Scan last 50 lines (one full turn with tool calls)
 for line in lines[-50:]:
     try:
@@ -101,11 +101,11 @@ for line in lines[-50:]:
                 # MCP Slack tool
                 if 'add_message' in tool_name or 'send_message' in tool_name:
                     sys.exit(0)  # Already replied via MCP
-                # Direct curl to Slack API via Bash tool
+                # Direct Slack API post via Bash tool
                 if tool_name == 'Bash':
                     cmd = block.get('input', {}).get('command', '')
                     if 'chat.postMessage' in cmd and thread_ts in cmd:
-                        sys.exit(0)  # Already replied via curl
+                        sys.exit(0)  # Already replied via direct API
     except Exception:
         pass
 
@@ -140,7 +140,7 @@ try:
 except Exception:
     converted_text = last_text
 
-# Output JSON payload for curl
+# Output JSON payload for Slack
 payload = {
     'channel': channel,
     'thread_ts': thread_ts,
@@ -154,43 +154,21 @@ EXIT_CODE=$?
 
 # Exit code 0 from Python means "already replied" (sys.exit(0) in the check above)
 # Exit code 1 means "not replied, no payload" — clean up and exit
-# If we got a payload (non-empty CURL_PAYLOAD), post it
+# If we got a payload (non-empty SLACK_PAYLOAD), post it
 
-if [ $EXIT_CODE -ne 0 ] || [ -z "$CURL_PAYLOAD" ]; then
+if [ $EXIT_CODE -ne 0 ] || [ -z "$SLACK_PAYLOAD" ]; then
   # Queue was already updated by Python (popped entry + wrote remaining)
   # Only clean up if Python exited with error (didn't get to pop)
   exit 0
 fi
 
-# Load Slack bot token from bridge .env
-BRIDGE_ENV="$HOME/Downloads/projects/tmux-slack-bridge/.env"
-SLACK_TOKEN=""
-if [ -f "$BRIDGE_ENV" ]; then
-  SLACK_TOKEN=$(grep "^SLACK_BOT_TOKEN=" "$BRIDGE_ENV" | cut -d= -f2- | tr -d '"' | tr -d "'")
-fi
-
-if [ -z "$SLACK_TOKEN" ]; then
-  # No token — can't post. Queue entry already popped by Python.
-  exit 0
-fi
-
-# Post to Slack
-SLACK_POST_RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
-  -H "Authorization: Bearer $SLACK_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$CURL_PAYLOAD" 2>/dev/null)
-
-# Persist only verified successful Slack sends. Failed sends intentionally write
-# no outbound row so closure checks cannot falsely pass.
-if [ -n "$SLACK_POST_RESPONSE" ]; then
-  BRIDGE_DIR="$HOME/Downloads/projects/tmux-slack-bridge"
-  if [ -d "$BRIDGE_DIR" ]; then
-    (
-      cd "$BRIDGE_DIR" || exit 0
-      printf '%s\n%s\n' "$CURL_PAYLOAD" "$SLACK_POST_RESPONSE" \
-        | npx --no-install tsx scripts/record-outbound-slack-message.ts
-    ) >/dev/null 2>&1 || true
-  fi
+BRIDGE_DIR="$HOME/Downloads/projects/tmux-slack-bridge"
+if [ -d "$BRIDGE_DIR" ]; then
+  (
+    cd "$BRIDGE_DIR" || exit 0
+    printf '%s' "$SLACK_PAYLOAD" \
+      | npx --no-install tsx scripts/post-and-record-slack-reply.ts
+  ) >/dev/null 2>&1 || true
 fi
 
 # Queue was already updated by Python (popped entry, wrote remaining or deleted file)

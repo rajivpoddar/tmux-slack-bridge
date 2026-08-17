@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { existsSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { spawnSync } from "child_process";
@@ -15,6 +15,8 @@ let searchMessages: typeof import("./db.ts").searchMessages;
 let closeDb: typeof import("./db.ts").closeDb;
 let persistVerifiedOutboundSlackMessage:
   typeof import("./scripts/record-outbound-slack-message.ts").persistVerifiedOutboundSlackMessage;
+let postAndRecordSlackReply:
+  typeof import("./scripts/post-and-record-slack-reply.ts").postAndRecordSlackReply;
 
 function countRows(body: string): number {
   const row = getDb()
@@ -26,8 +28,10 @@ function countRows(body: string): number {
 describe("verified outbound Slack recording", () => {
   beforeAll(async () => {
     const recorder = await import("./scripts/record-outbound-slack-message.ts");
+    const sender = await import("./scripts/post-and-record-slack-reply.ts");
     const db = await import("./db.ts");
     persistVerifiedOutboundSlackMessage = recorder.persistVerifiedOutboundSlackMessage;
+    postAndRecordSlackReply = sender.postAndRecordSlackReply;
     getDb = db.getDb;
     searchMessages = db.searchMessages;
     closeDb = db.closeDb;
@@ -171,5 +175,53 @@ describe("verified outbound Slack recording", () => {
       if (existsSync(`${cliDb}-shm`)) unlinkSync(`${cliDb}-shm`);
       if (existsSync(`${cliDb}-wal`)) unlinkSync(`${cliDb}-wal`);
     }
+  });
+
+  test("postAndRecordSlackReply persists ok:true Slack responses", async () => {
+    const text = "bridge obligation 752 helper ok";
+    const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      expect(init?.body).toBe(JSON.stringify(payload));
+      return {
+        json: async () => ({
+          ok: true,
+          channel: "C0OUTBOUND",
+          ts: "1787000000.000400",
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      expect(await postAndRecordSlackReply(payload, "xoxb-test-token")).toBe(true);
+      expect(countRows(text)).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("postAndRecordSlackReply persists zero rows for ok:false Slack responses", async () => {
+    const text = "bridge obligation 752 helper failed";
+    const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      ({
+        json: async () => ({ ok: false, channel: "C0OUTBOUND", ts: "1787000000.000401" }),
+      }) as Response) as typeof fetch;
+
+    try {
+      expect(await postAndRecordSlackReply(payload, "xoxb-test-token")).toBe(false);
+      expect(countRows(text)).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Stop hook does not put Slack token or payload on process argv", () => {
+    const hook = readFileSync("scripts/reply-to-slack.sh", "utf8");
+    expect(hook).toContain("scripts/post-and-record-slack-reply.ts");
+    expect(hook).not.toContain("curl ");
+    expect(hook).not.toContain("Authorization: Bearer");
+    expect(hook).not.toContain("SLACK_TOKEN");
   });
 });
