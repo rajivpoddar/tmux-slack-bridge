@@ -11,6 +11,7 @@ process.env.DB_PATH = TEST_DB;
 if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
 
 let getDb: typeof import("./db.ts").getDb;
+let recordMessage: typeof import("./db.ts").recordMessage;
 let searchMessages: typeof import("./db.ts").searchMessages;
 let closeDb: typeof import("./db.ts").closeDb;
 let persistVerifiedOutboundSlackMessage:
@@ -33,6 +34,7 @@ describe("verified outbound Slack recording", () => {
     persistVerifiedOutboundSlackMessage = recorder.persistVerifiedOutboundSlackMessage;
     postAndRecordSlackReply = sender.postAndRecordSlackReply;
     getDb = db.getDb;
+    recordMessage = db.recordMessage;
     searchMessages = db.searchMessages;
     closeDb = db.closeDb;
     getDb();
@@ -148,6 +150,51 @@ describe("verified outbound Slack recording", () => {
     ).toBe(true);
 
     expect(countRows(text)).toBe(2);
+  });
+
+  test("existing inbound row with the same identity is normalized to outbound", () => {
+    const text = "bridge obligation 752 inbound-promoted";
+    const ts = "1787000000.000202";
+    recordMessage({
+      ts,
+      threadTs: "1786941665.403559",
+      channelId: "C0OUTBOUND",
+      channelType: "channel",
+      userId: "U0INBOUND",
+      userName: "Inbound Bot",
+      body: "inbound-first",
+      hasImages: false,
+      hasSnippets: false,
+    });
+
+    expect(
+      persistVerifiedOutboundSlackMessage(
+        {
+          channel: "C0OUTBOUND",
+          thread_ts: "1786941665.403559",
+          text,
+        },
+        {
+          ok: true,
+          channel: "C0OUTBOUND",
+          ts,
+          message: { user: "U0BRIDGE", username: "Bridge Bot" },
+        }
+      )
+    ).toBe(true);
+
+    const row = getDb()
+      .prepare(
+        "SELECT direction, user_id, user_name, body FROM messages WHERE channel_id = ? AND ts = ?"
+      )
+      .get("C0OUTBOUND", ts) as any;
+    expect(row).toMatchObject({
+      direction: "outbound",
+      user_id: "U0BRIDGE",
+      user_name: "Bridge Bot",
+      body: text,
+    });
+    expect(countRows(text)).toBe(1);
   });
 
   test("postAndRecordSlackReply CLI exits nonzero without a bridge token", () => {

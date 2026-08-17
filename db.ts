@@ -206,11 +206,34 @@ export function recordOutboundMessage(params: {
 
   if (insert.changes === 1) return true;
   // Idempotent replay of the same Slack message identity is still a verified
-  // success when the row already exists (inbound or outbound).
+  // success when the existing row is already the normalized outbound record.
   const existing = db
-    .prepare("SELECT 1 FROM messages WHERE channel_id = ? AND ts = ? LIMIT 1")
+    .prepare(
+      "SELECT direction FROM messages WHERE channel_id = ? AND ts = ? LIMIT 1"
+    )
     .get(params.channelId, params.ts);
-  return !!existing;
+  if (!existing) return false;
+  if (existing.direction === "outbound") return true;
+  // A concurrent inbound/poll handler recorded the same Slack message first.
+  // Promote it to the verified outbound record atomically; the inbound claim
+  // cannot win this update after the row was already persisted.
+  const promoted = db
+    .prepare(
+      `UPDATE messages
+       SET direction = 'outbound', channel_type = ?, thread_ts = ?,
+           user_id = ?, user_name = ?, body = ?
+       WHERE channel_id = ? AND ts = ? AND direction = 'inbound'`
+    )
+    .run(
+      params.channelType,
+      params.threadTs,
+      params.userId,
+      params.userName,
+      params.body,
+      params.channelId,
+      params.ts
+    );
+  return promoted.changes === 1;
 }
 
 /**
