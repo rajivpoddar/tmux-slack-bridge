@@ -44,7 +44,7 @@ JSONL="$HOME/.claude/projects/-${PROJECT_DIR_NAME}/${SESSION_ID}.jsonl"
 export SESSION_ID CWD
 
 SLACK_PAYLOAD=$(python3 - <<'PYEOF'
-import json, sys, os, time, subprocess
+import json, re, sys, os, time, subprocess
 
 PENDING_FILE = '/tmp/slack-bridge-last-inject.json'
 
@@ -142,7 +142,7 @@ try:
     # Already replied via MCP or direct API this turn? Only commit removal
     # after a verified Slack success receipt; otherwise restore the owned
     # entry so the claimed inbound message keeps its reply target.
-    replied_tool_seen = False
+    replied_tool_ids = set()
     reply_ok_seen = False
     for line in lines[-50:]:
         try:
@@ -158,12 +158,16 @@ try:
                 owned_target = channel in input_text and thread_ts in input_text
                 if 'add_message' in tool_name or 'send_message' in tool_name:
                     if owned_target:
-                        replied_tool_seen = True
+                        if isinstance(block.get('id'), str):
+                            replied_tool_ids.add(block['id'])
                 elif tool_name == 'Bash':
                     cmd = input_text
                     if 'chat.postMessage' in cmd and owned_target:
-                        replied_tool_seen = True
+                        if isinstance(block.get('id'), str):
+                            replied_tool_ids.add(block['id'])
             elif block.get('type') == 'tool_result':
+                if block.get('tool_use_id') not in replied_tool_ids:
+                    continue
                 content = block.get('content')
                 candidates = []
                 if isinstance(content, str):
@@ -173,15 +177,34 @@ try:
                         if isinstance(item, dict) and item.get('type') == 'text':
                             candidates.append(item.get('text', ''))
                 for candidate in candidates:
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict) and parsed.get('ok') is True:
+                            resp_channel = parsed.get('channel')
+                            msg = parsed.get('message') if isinstance(parsed.get('message'), dict) else {}
+                            resp_thread = parsed.get('thread_ts') or msg.get('thread_ts')
+                            resp_ts = parsed.get('ts') or msg.get('ts')
+                            if (
+                                resp_channel == channel
+                                and resp_thread == thread_ts
+                                and isinstance(resp_ts, str)
+                                and bool(resp_ts)
+                            ):
+                                reply_ok_seen = True
+                                break
+                    except Exception:
+                        pass
                     compact = candidate.replace(' ', '')
+                    ts_match = re.search(r'"ts":"([^"]+)"', compact)
                     if (
                         '"ok":true' in compact
                         and f'"channel":"{channel}"' in compact
-                        and '"ts":"' in compact
+                        and f'"thread_ts":"{thread_ts}"' in compact
+                        and bool(ts_match and ts_match.group(1))
                     ):
                         reply_ok_seen = True
                         break
-    if replied_tool_seen:
+    if replied_tool_ids:
         if reply_ok_seen:
             commit_removal()
             sys.exit(0)
