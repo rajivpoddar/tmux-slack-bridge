@@ -24,6 +24,7 @@ import { App } from "@slack/bolt";
 import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
+import { randomUUID } from "node:crypto";
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -159,7 +160,7 @@ export function appendReplyContextQueue(
   threadTs: string,
   ts: string,
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
-): boolean {
+): string | null {
   try {
     const queue = existsSync(queueFile)
       ? (() => {
@@ -171,21 +172,18 @@ export function appendReplyContextQueue(
           }
         })()
       : [];
-    if (queue.some((entry: any) => entry.channel === channel && entry.ts === ts)) {
-      return true;
-    }
-    queue.push({ channel, thread_ts: threadTs, ts });
+    const entryId = randomUUID();
+    queue.push({ id: entryId, channel, thread_ts: threadTs, ts });
     writeFileSync(queueFile, JSON.stringify(queue));
-    return true;
+    return entryId;
   } catch (err: any) {
     log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
-    return false;
+    return null;
   }
 }
 
 export function removeReplyContextQueue(
-  channel: string,
-  ts: string,
+  entryId: string,
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): boolean {
   try {
@@ -193,7 +191,7 @@ export function removeReplyContextQueue(
     const d = JSON.parse(readFileSync(queueFile, "utf8"));
     const queue = Array.isArray(d) ? d : [d];
     const remaining = queue.filter(
-      (entry: any) => !(entry.channel === channel && entry.ts === ts)
+      (entry: any) => !(entry.id === entryId)
     );
     if (remaining.length === queue.length) return false;
     writeFileSync(queueFile, JSON.stringify(remaining));
@@ -659,10 +657,16 @@ async function handleSlackMessage(
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    // Append reply context before the DB claim so a crash cannot leave a
-    // recorded message without its reply target. If the claim is lost, the
-    // exact identity-bearing entry is removed so a replay cannot re-forward.
-    appendReplyContextQueue(msg.channel, threadTs, msg.ts);
+    // Append an owned reply-context entry before the DB claim so a crash cannot
+    // leave a recorded message without its reply target. The claim owner keeps
+    // its own entry; only that invocation may remove it on a lost claim.
+    const replyContextId = appendReplyContextQueue(msg.channel, threadTs, msg.ts);
+    if (replyContextId === null) {
+      log(
+        `↩️ Dropped ${source} message ${msg.channel}/${msg.ts} (reply context queue unavailable)`
+      );
+      return false;
+    }
 
     // Record in SQLite — use effectiveUserId for bot messages (bot_id fallback).
     // recordMessage is the atomic dedup claim: two handlers that both pass the
@@ -692,7 +696,7 @@ async function handleSlackMessage(
       log(
         `↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts} (record claim lost)`
       );
-      removeReplyContextQueue(msg.channel, msg.ts);
+      removeReplyContextQueue(replyContextId);
       return false;
     }
 
@@ -828,9 +832,15 @@ app.event("app_mention", async ({ event, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    // Identity-bearing reply context is appended before the claim; a lost
-    // claim removes exactly that entry so replay can retry cleanly.
-    appendReplyContextQueue(event.channel, threadTs, event.ts);
+    // Owned reply-context entry before the claim; the losing invocation removes
+    // only its own entry and never the winner's context.
+    const replyContextId = appendReplyContextQueue(event.channel, threadTs, event.ts);
+    if (replyContextId === null) {
+      log(
+        `↩️ Dropped @mention ${event.channel}/${event.ts} (reply context queue unavailable)`
+      );
+      return;
+    }
 
     // Record in SQLite. The atomic claim also guards this path so a replayed
     // app_mention (socket redelivery, duplicate instance) is never forwarded
@@ -856,7 +866,7 @@ app.event("app_mention", async ({ event, client }) => {
       log(
         `↩️ Skipped duplicate @mention ${event.channel}/${event.ts} (record claim lost)`
       );
-      removeReplyContextQueue(event.channel, event.ts);
+      removeReplyContextQueue(replyContextId);
       return;
     }
 

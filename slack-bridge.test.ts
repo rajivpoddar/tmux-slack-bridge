@@ -258,22 +258,25 @@ describe("crash-recovery watermark guard (#4984)", () => {
   test("appendReplyContextQueue records reply targets without changing routing state", () => {
     const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
     try {
-      expect(appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile)).toBe(true);
+      const entryId = appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile);
+      expect(typeof entryId).toBe("string");
       const queue = JSON.parse(readFileSync(queueFile, "utf8"));
       expect(queue).toEqual([
-        { channel: "C0QUEUE", thread_ts: "700.001", ts: "700.009" },
+        { id: entryId, channel: "C0QUEUE", thread_ts: "700.001", ts: "700.009" },
       ]);
     } finally {
       if (existsSync(queueFile)) unlinkSync(queueFile);
     }
   });
 
-  test("appendReplyContextQueue dedupes by message identity", () => {
+  test("appendReplyContextQueue returns a distinct owned id per invocation", () => {
     const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
     try {
-      expect(appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile)).toBe(true);
-      expect(appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile)).toBe(true);
-      expect(appendReplyContextQueue("C0QUEUE", "700.001", "700.010", queueFile)).toBe(true);
+      const first = appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile);
+      const second = appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile);
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(first).not.toBe(second);
       const queue = JSON.parse(readFileSync(queueFile, "utf8"));
       expect(queue).toHaveLength(2);
     } finally {
@@ -281,15 +284,15 @@ describe("crash-recovery watermark guard (#4984)", () => {
     }
   });
 
-  test("removeReplyContextQueue removes exactly the lost claim identity", () => {
+  test("removeReplyContextQueue removes only the owning invocation entry", () => {
     const queueFile = join(tmpdir(), `bridge-reply-context-${Date.now()}.json`);
     try {
-      appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile);
-      appendReplyContextQueue("C0QUEUE", "700.002", "700.010", queueFile);
-      expect(removeReplyContextQueue("C0QUEUE", "700.009", queueFile)).toBe(true);
+      const first = appendReplyContextQueue("C0QUEUE", "700.001", "700.009", queueFile);
+      const second = appendReplyContextQueue("C0QUEUE", "700.002", "700.010", queueFile);
+      expect(removeReplyContextQueue(first!, queueFile)).toBe(true);
       const queue = JSON.parse(readFileSync(queueFile, "utf8"));
       expect(queue).toEqual([
-        { channel: "C0QUEUE", thread_ts: "700.002", ts: "700.010" },
+        { id: second, channel: "C0QUEUE", thread_ts: "700.002", ts: "700.010" },
       ]);
     } finally {
       if (existsSync(queueFile)) unlinkSync(queueFile);
@@ -299,7 +302,7 @@ describe("crash-recovery watermark guard (#4984)", () => {
   test("appendReplyContextQueue is best-effort on write failure", () => {
     const queueDir = mkdtempSync(join(tmpdir(), "bridge-reply-context-dir-"));
     try {
-      expect(appendReplyContextQueue("C0QUEUE", "700.002", "700.011", queueDir)).toBe(false);
+      expect(appendReplyContextQueue("C0QUEUE", "700.002", "700.011", queueDir)).toBeNull();
     } finally {
       rmSync(queueDir, { recursive: true, force: true });
     }
