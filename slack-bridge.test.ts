@@ -17,7 +17,9 @@ import { tmpdir } from "os";
 
 // --- Test DB setup (before module imports) ---
 const TEST_DB = join(tmpdir(), `bridge-test-4984-${Date.now()}.db`);
+const TEST_QUEUE = join(tmpdir(), `bridge-test-queue-${Date.now()}.json`);
 process.env.DB_PATH = TEST_DB;
+process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE = TEST_QUEUE;
 process.env.TMUX_TARGET = "0:0.99";
 process.env.SLACK_CHANNEL = "C0TEST4984";
 process.env.SLACK_BOT_TOKEN = "xoxb-test";
@@ -63,6 +65,7 @@ let wasRecorded: typeof import("./slack-bridge.ts").wasRecorded;
 let markSeen: typeof import("./slack-bridge.ts").markSeen;
 let latestRecordedTs: typeof import("./slack-bridge.ts").latestRecordedTs;
 let appendReplyContextQueue: typeof import("./slack-bridge.ts").appendReplyContextQueue;
+let pollSlackHistory: typeof import("./slack-bridge.ts").pollSlackHistory;
 
 describe("crash-recovery watermark guard (#4984)", () => {
   beforeAll(async () => {
@@ -76,6 +79,7 @@ describe("crash-recovery watermark guard (#4984)", () => {
     markSeen = bridge.markSeen;
     latestRecordedTs = bridge.latestRecordedTs;
     appendReplyContextQueue = bridge.appendReplyContextQueue;
+    pollSlackHistory = bridge.pollSlackHistory;
 
     getDb();
   });
@@ -84,6 +88,9 @@ describe("crash-recovery watermark guard (#4984)", () => {
     closeDb();
     globalThis.fetch = origFetch;
     if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
+    if (existsSync(`${TEST_DB}-shm`)) unlinkSync(`${TEST_DB}-shm`);
+    if (existsSync(`${TEST_DB}-wal`)) unlinkSync(`${TEST_DB}-wal`);
+    if (existsSync(TEST_QUEUE)) unlinkSync(TEST_QUEUE);
   });
 
   let channelSeq = 0;
@@ -143,6 +150,60 @@ describe("crash-recovery watermark guard (#4984)", () => {
     });
 
     expect(latestRecordedTs(ch)).toBe("150.001");
+  });
+
+  test("pollSlackHistory paginates past recorded outbound rows to recover inbound", async () => {
+    const ch = "C0TEST4984";
+    record(ch, "800.000000", "poll anchor");
+
+    const outboundMessages = Array.from({ length: 50 }, (_, i) => {
+      const ts = `900.${String(i + 1).padStart(6, "0")}`;
+      recordOutboundMessage({
+        ts,
+        threadTs: "800.000000",
+        channelId: ch,
+        channelType: "channel",
+        userId: "U0BRIDGE",
+        userName: "Bridge Bot",
+        body: `recorded outbound ${i + 1}`,
+      });
+      return { ts, text: `recorded outbound ${i + 1}`, user: "U0BRIDGE" };
+    });
+
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        messages: outboundMessages,
+        response_metadata: { next_cursor: "page-2" },
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            ts: "850.000000",
+            text: "unrecorded inbound behind outbound page",
+            user: "U0TEST",
+          },
+        ],
+        response_metadata: { next_cursor: "" },
+      });
+    const client = {
+      users: {
+        info: vi.fn().mockResolvedValue({
+          user: { profile: { display_name: "Poll Tester" } },
+        }),
+      },
+      conversations: {
+        history,
+        replies: vi.fn().mockResolvedValue({ messages: [] }),
+      },
+    };
+
+    await pollSlackHistory(client as any);
+
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(history.mock.calls[0]?.[0]).not.toHaveProperty("cursor");
+    expect(history.mock.calls[1]?.[0]).toMatchObject({ cursor: "page-2" });
+    expect(wasRecorded(ch, "850.000000")).toBe(true);
   });
 
   test("crash mid-batch: unrecorded messages not in DB, not skipped", () => {

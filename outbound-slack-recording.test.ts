@@ -106,6 +106,17 @@ describe("verified outbound Slack recording", () => {
     expect(countRows(text)).toBe(0);
   });
 
+  test("malformed ok:true Slack response persists zero rows", () => {
+    const text = "bridge obligation 752 malformed success";
+    const persisted = persistVerifiedOutboundSlackMessage(
+      { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text },
+      { ok: true, channel: "C0OUTBOUND" }
+    );
+
+    expect(persisted).toBe(false);
+    expect(countRows(text)).toBe(0);
+  });
+
   test("retrying the exact same outbound message does not duplicate rows", () => {
     const text = "bridge obligation 752 idempotent replay";
     const payload = { channel: "C0OUTBOUND", thread_ts: "1786941665.403559", text };

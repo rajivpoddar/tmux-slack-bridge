@@ -157,7 +157,7 @@ function log(msg: string) {
 export function appendReplyContextQueue(
   channel: string,
   threadTs: string,
-  queueFile = "/tmp/slack-bridge-last-inject.json"
+  queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): boolean {
   try {
     const queue = existsSync(queueFile)
@@ -838,7 +838,7 @@ app.event("app_mention", async ({ event, client }) => {
   }
 });
 
-async function pollSlackHistory(client: WebClient) {
+export async function pollSlackHistory(client: WebClient) {
   if (pollInFlight) return;
   pollInFlight = true;
 
@@ -846,24 +846,43 @@ async function pollSlackHistory(client: WebClient) {
     for (const channel of SLACK_CHANNELS) {
       const latestTs = latestRecordedTs(channel);
       const oldest = latestTs || String(Math.floor(Date.now() / 1000) - POLL_LOOKBACK_SECONDS);
-      const result = await client.conversations.history({
-        channel,
-        oldest,
-        inclusive: false,
-        limit: 50,
-      });
-
-      const messages = (result.messages || [])
-        .filter((m: any) => m.ts && (m.text || m.files))
-        .sort((a: any, b: any) => Number(a.ts) - Number(b.ts));
-
       let handled = 0;
-      for (const raw of messages) {
-        const msg = { ...raw, channel } as unknown as GenericMessageEvent;
-        if (wasRecorded(channel, msg.ts)) continue;
-        if (await handleSlackMessage(msg, client, "poll")) {
-          handled += 1;
+      let cursor: string | undefined;
+      let pages = 0;
+      const configuredMaxPages = Number(process.env.SLACK_HISTORY_POLL_MAX_PAGES || 0);
+      const maxPages =
+        Number.isFinite(configuredMaxPages) && configuredMaxPages > 0
+          ? configuredMaxPages
+          : Number.POSITIVE_INFINITY;
+
+      do {
+        const result: any = await client.conversations.history({
+          channel,
+          oldest,
+          inclusive: false,
+          limit: 50,
+          ...(cursor ? { cursor } : {}),
+        });
+
+        const messages = (result.messages || [])
+          .filter((m: any) => m.ts && (m.text || m.files))
+          .sort((a: any, b: any) => Number(a.ts) - Number(b.ts));
+
+        for (const raw of messages) {
+          const msg = { ...raw, channel } as unknown as GenericMessageEvent;
+          if (wasRecorded(channel, msg.ts)) continue;
+          if (await handleSlackMessage(msg, client, "poll")) {
+            handled += 1;
+          }
         }
+
+        const nextCursor = result.response_metadata?.next_cursor;
+        cursor = typeof nextCursor === "string" && nextCursor.trim() ? nextCursor : undefined;
+        pages += 1;
+      } while (cursor && pages < maxPages);
+
+      if (cursor) {
+        log(`🧭 Poll stopped after ${pages} page(s) for ${channel}; cursor remains`);
       }
 
       if (handled > 0) {
