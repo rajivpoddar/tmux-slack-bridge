@@ -157,6 +157,7 @@ function log(msg: string) {
 export function appendReplyContextQueue(
   channel: string,
   threadTs: string,
+  ts: string,
   queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
 ): boolean {
   try {
@@ -170,8 +171,32 @@ export function appendReplyContextQueue(
           }
         })()
       : [];
-    queue.push({ channel, thread_ts: threadTs });
+    if (queue.some((entry: any) => entry.channel === channel && entry.ts === ts)) {
+      return true;
+    }
+    queue.push({ channel, thread_ts: threadTs, ts });
     writeFileSync(queueFile, JSON.stringify(queue));
+    return true;
+  } catch (err: any) {
+    log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
+    return false;
+  }
+}
+
+export function removeReplyContextQueue(
+  channel: string,
+  ts: string,
+  queueFile = process.env.BRIDGE_REPLY_CONTEXT_QUEUE_FILE || "/tmp/slack-bridge-last-inject.json"
+): boolean {
+  try {
+    if (!existsSync(queueFile)) return false;
+    const d = JSON.parse(readFileSync(queueFile, "utf8"));
+    const queue = Array.isArray(d) ? d : [d];
+    const remaining = queue.filter(
+      (entry: any) => !(entry.channel === channel && entry.ts === ts)
+    );
+    if (remaining.length === queue.length) return false;
+    writeFileSync(queueFile, JSON.stringify(remaining));
     return true;
   } catch (err: any) {
     log(`⚠️ Failed to update Slack reply context queue: ${err.message}`);
@@ -634,6 +659,11 @@ async function handleSlackMessage(
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
+    // Append reply context before the DB claim so a crash cannot leave a
+    // recorded message without its reply target. If the claim is lost, the
+    // exact identity-bearing entry is removed so a replay cannot re-forward.
+    appendReplyContextQueue(msg.channel, threadTs, msg.ts);
+
     // Record in SQLite — use effectiveUserId for bot messages (bot_id fallback).
     // recordMessage is the atomic dedup claim: two handlers that both pass the
     // wasRecorded() fast-path (socket vs poll, or a duplicate process) race on
@@ -662,13 +692,9 @@ async function handleSlackMessage(
       log(
         `↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts} (record claim lost)`
       );
+      removeReplyContextQueue(msg.channel, msg.ts);
       return false;
     }
-
-    // Append to inject queue only after the DB claim succeeds. This queue is
-    // outbound reply context for the PM Stop hook; duplicate inbound events that
-    // lose the claim must not leave stale reply targets behind.
-    appendReplyContextQueue(msg.channel, threadTs);
 
     // Append to shared channel log files (slots / PM can read anytime)
     if (msg.channel === HEYDONNA_DEV_CHANNEL) {
@@ -802,6 +828,10 @@ app.event("app_mention", async ({ event, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
+    // Identity-bearing reply context is appended before the claim; a lost
+    // claim removes exactly that entry so replay can retry cleanly.
+    appendReplyContextQueue(event.channel, threadTs, event.ts);
+
     // Record in SQLite. The atomic claim also guards this path so a replayed
     // app_mention (socket redelivery, duplicate instance) is never forwarded
     // twice. DB write failure fails open (still forwards once).
@@ -826,10 +856,9 @@ app.event("app_mention", async ({ event, client }) => {
       log(
         `↩️ Skipped duplicate @mention ${event.channel}/${event.ts} (record claim lost)`
       );
+      removeReplyContextQueue(event.channel, event.ts);
       return;
     }
-
-    appendReplyContextQueue(event.channel, threadTs);
 
     await sendToPane(fullMessage);
     log(`✅ @mention forwarded to ${TMUX_TARGET}`);
