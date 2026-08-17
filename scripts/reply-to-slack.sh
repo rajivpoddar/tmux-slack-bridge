@@ -115,9 +115,16 @@ try:
     if len(queue) == 0:
         os.remove(PENDING_FILE)
         sys.exit(1)
-    if not isinstance(queue[0], dict):
-        sys.exit(1)
-    ctx = queue.pop(0)  # Pop oldest, but commit only after verified success
+    for entry in queue:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get('channel'), str)
+            or not entry.get('channel')
+            or not isinstance(entry.get('thread_ts'), str)
+            or not entry.get('thread_ts')
+        ):
+            sys.exit(1)
+    ctx = queue.pop(0)  # Pop oldest only after the full queue validates
     channel = ctx.get('channel', '')
     thread_ts = ctx.get('thread_ts', '')
     if not channel or not thread_ts:
@@ -129,6 +136,11 @@ try:
                 json.dump(queue, f)
         else:
             os.remove(PENDING_FILE)
+
+    def restore_owned():
+        queue.insert(0, ctx)
+        with open(PENDING_FILE, 'w') as f:
+            json.dump(queue, f)
 
     # Already replied via MCP or direct API this turn?
     for line in lines[-50:]:
@@ -164,7 +176,7 @@ try:
             pass
 
     if not last_text.strip():
-        commit_removal()
+        restore_owned()
         sys.exit(1)
 
     _converter = os.path.expanduser('~/.claude/skills/slack-markdown/scripts/md-to-mrkdwn.py')
@@ -199,9 +211,7 @@ try:
     if ok:
         commit_removal()
     else:
-        queue.insert(0, ctx)
-        with open(PENDING_FILE, 'w') as f:
-            json.dump(queue, f)
+        restore_owned()
     sys.exit(0 if ok else 1)
 finally:
     try:
