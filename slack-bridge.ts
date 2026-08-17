@@ -25,7 +25,7 @@ import type { GenericMessageEvent } from "@slack/types";
 import { type WebClient } from "@slack/web-api";
 import { execSync } from "child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, readFileSync, existsSync, appendFileSync, openSync, closeSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, linkSync, unlinkSync } from "fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { recordMessage, setThreadOwner, getThreadOwner, getDb, closeDb } from "./db.ts";
@@ -170,41 +170,57 @@ function withQueueLock<T>(
       ? configuredTimeout
       : 1500;
   const deadline = Date.now() + lockTimeoutMs;
-  let fd: number | null = null;
+  let acquired = false;
   while (Date.now() < deadline) {
     try {
-      fd = openSync(lockPath, "wx");
-      writeFileSync(lockPath, String(process.pid));
-      break;
+      acquired = tryAcquireQueueLock(lockPath);
+      if (acquired) break;
     } catch (error: any) {
-      if (error?.code !== "EEXIST") {
-        log(`⚠️ Failed to acquire Slack reply context queue lock: ${error?.message || error}`);
-        return null;
-      }
-      try {
-        const owner = Number(readFileSync(lockPath, "utf8").trim());
-        if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        // Unreadable lock contents cannot prove the owner is dead.
-      }
-      sleepSync(25);
+      log(`⚠️ Failed to acquire Slack reply context queue lock: ${error?.message || error}`);
+      return null;
     }
+    try {
+      const owner = Number(readFileSync(lockPath, "utf8").trim());
+      if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
+        unlinkSync(lockPath);
+        continue;
+      }
+    } catch {
+      // Unreadable lock contents cannot prove the owner is dead.
+    }
+    sleepSync(25);
   }
-  if (fd === null) {
+  if (!acquired) {
     log(`⚠️ Slack reply context queue lock timeout: ${lockPath}`);
     return null;
   }
   try {
-    closeSync(fd);
     return fn();
   } finally {
     try {
       unlinkSync(lockPath);
     } catch {
-      // Lock cleanup is best-effort; a stale lock times out on the next writer.
+      // Lock cleanup is best-effort; a stale lock is reclaimed by its owner.
+    }
+  }
+}
+
+function tryAcquireQueueLock(lockPath: string): boolean {
+  const tempLockPath = `${lockPath}.tmp.${process.pid}.${randomUUID()}`;
+  writeFileSync(tempLockPath, String(process.pid));
+  try {
+    // Atomic no-replace publication: the lock path never exists without an
+    // owner identity, so a crash cannot leave an ownerless lock.
+    linkSync(tempLockPath, lockPath);
+    return true;
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") throw error;
+    return false;
+  } finally {
+    try {
+      unlinkSync(tempLockPath);
+    } catch {
+      // Temp cleanup is best-effort.
     }
   }
 }

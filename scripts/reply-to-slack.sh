@@ -64,8 +64,9 @@ except Exception:
     sys.exit(1)
 
 LOCK_FILE = PENDING_FILE + '.lock'
+LOCK_TEMP = LOCK_FILE + '.tmp.' + str(os.getpid())
 deadline = time.time() + 1.5
-lock_fd = None
+lock_acquired = False
 def owner_alive(pid):
     try:
         os.kill(pid, 0)
@@ -76,22 +77,36 @@ def owner_alive(pid):
         return True
     except Exception:
         return False
+def acquire_lock():
+    with open(LOCK_TEMP, 'w') as f:
+        f.write(str(os.getpid()))
+    try:
+        os.link(LOCK_TEMP, LOCK_FILE)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        try:
+            os.remove(LOCK_TEMP)
+        except OSError:
+            pass
 while time.time() < deadline:
     try:
-        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(lock_fd, str(os.getpid()).encode())
-        break
-    except FileExistsError:
-        try:
-            with open(LOCK_FILE) as f:
-                owner = int((f.read().strip() or '0'))
-            if owner > 0 and not owner_alive(owner):
-                os.remove(LOCK_FILE)
-                continue
-        except (ValueError, OSError):
-            pass
-        time.sleep(0.025)
-if lock_fd is None:
+        if acquire_lock():
+            lock_acquired = True
+            break
+    except OSError:
+        sys.exit(1)
+    try:
+        with open(LOCK_FILE) as f:
+            owner = int((f.read().strip() or '0'))
+        if owner > 0 and not owner_alive(owner):
+            os.remove(LOCK_FILE)
+            continue
+    except (ValueError, OSError):
+        pass
+    time.sleep(0.025)
+if not lock_acquired:
     sys.exit(1)
 
 try:
@@ -189,7 +204,6 @@ try:
             json.dump(queue, f)
     sys.exit(0 if ok else 1)
 finally:
-    os.close(lock_fd)
     try:
         os.remove(LOCK_FILE)
     except OSError:
