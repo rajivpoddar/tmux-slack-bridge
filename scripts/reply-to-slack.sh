@@ -116,14 +116,11 @@ try:
         os.remove(PENDING_FILE)
         sys.exit(1)
     for entry in queue:
-        if (
-            not isinstance(entry, dict)
-            or not isinstance(entry.get('channel'), str)
-            or not entry.get('channel')
-            or not isinstance(entry.get('thread_ts'), str)
-            or not entry.get('thread_ts')
-        ):
+        if not isinstance(entry, dict):
             sys.exit(1)
+        for field in ('id', 'channel', 'thread_ts', 'ts'):
+            if not isinstance(entry.get(field), str) or not entry.get(field):
+                sys.exit(1)
     ctx = queue.pop(0)  # Pop oldest only after the full queue validates
     channel = ctx.get('channel', '')
     thread_ts = ctx.get('thread_ts', '')

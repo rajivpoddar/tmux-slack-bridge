@@ -269,6 +269,7 @@ describe("verified outbound Slack recording", () => {
     const hook = readFileSync("scripts/reply-to-slack.sh", "utf8");
     expect(hook).toContain("scripts/post-and-record-slack-reply.ts");
     expect(hook).toContain("PENDING_FILE + '.lock'");
+    expect(hook).toContain("'id', 'channel', 'thread_ts', 'ts'");
     expect(hook).not.toContain("curl ");
     expect(hook).not.toContain("Authorization: Bearer");
     expect(hook).not.toContain("SLACK_TOKEN");
