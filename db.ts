@@ -204,7 +204,13 @@ export function recordOutboundMessage(params: {
     params.body
   );
 
-  return insert.changes === 1;
+  if (insert.changes === 1) return true;
+  // Idempotent replay of the same Slack message identity is still a verified
+  // success when the row already exists (inbound or outbound).
+  const existing = db
+    .prepare("SELECT 1 FROM messages WHERE channel_id = ? AND ts = ? LIMIT 1")
+    .get(params.channelId, params.ts);
+  return !!existing;
 }
 
 /**

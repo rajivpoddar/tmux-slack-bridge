@@ -70,13 +70,15 @@ export async function postAndRecordSlackReply(
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : "";
 if (import.meta.url === invokedPath) {
   const payload = readPayloadFromStdin();
+  if (!payload) process.exit(2);
   const token = readSlackBotToken();
+  if (!token) process.exit(2);
 
-  if (payload && token) {
-    try {
-      await postAndRecordSlackReply(payload, token);
-    } finally {
-      closeDb();
-    }
+  let recorded = false;
+  try {
+    recorded = await postAndRecordSlackReply(payload, token);
+  } finally {
+    closeDb();
   }
+  if (!recorded) process.exit(2);
 }

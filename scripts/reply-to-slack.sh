@@ -44,56 +44,10 @@ JSONL="$HOME/.claude/projects/-${PROJECT_DIR_NAME}/${SESSION_ID}.jsonl"
 export SESSION_ID CWD
 
 SLACK_PAYLOAD=$(python3 - <<'PYEOF'
-import json, sys, os
+import json, sys, os, time, subprocess
 
 PENDING_FILE = '/tmp/slack-bridge-last-inject.json'
 
-# Load pending context from FIFO queue (pop oldest entry) under the same
-# exclusive lock the bridge uses for append/remove, so a concurrent Stop hook
-# cannot read the same head twice or overwrite a newer queue update.
-try:
-    import time
-    LOCK_FILE = PENDING_FILE + '.lock'
-    deadline = time.time() + 1.5
-    lock_fd = None
-    while time.time() < deadline:
-        try:
-            lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            time.sleep(0.025)
-    if lock_fd is None:
-        sys.exit(1)
-    try:
-        raw = json.load(open(PENDING_FILE))
-        # Support both old format (single object) and new format (array queue)
-        if isinstance(raw, list):
-            if len(raw) == 0:
-                os.remove(PENDING_FILE)
-                sys.exit(1)
-            ctx = raw.pop(0)  # Pop oldest
-            # Write remaining queue back (or delete if empty)
-            if raw:
-                with open(PENDING_FILE, 'w') as f:
-                    json.dump(raw, f)
-            else:
-                os.remove(PENDING_FILE)
-        else:
-            ctx = raw  # Legacy single-object format
-        channel = ctx.get('channel', '')
-        thread_ts = ctx.get('thread_ts', '')
-        if not channel or not thread_ts:
-            sys.exit(1)
-    finally:
-        os.close(lock_fd)
-        try:
-            os.remove(LOCK_FILE)
-        except OSError:
-            pass
-except Exception:
-    sys.exit(1)
-
-# Find JSONL
 session_id = os.environ.get('SESSION_ID', '')
 cwd = os.environ.get('CWD', '')
 if not session_id or not cwd:
@@ -109,90 +63,121 @@ try:
 except Exception:
     sys.exit(1)
 
-# Check if this turn already replied to Slack via ANY mechanism:
-# 1. MCP conversations_add_message tool call
-# 2. Bash tool call containing chat.postMessage (direct API posts)
-# Scan last 50 lines (one full turn with tool calls)
-for line in lines[-50:]:
+LOCK_FILE = PENDING_FILE + '.lock'
+deadline = time.time() + 1.5
+lock_fd = None
+while time.time() < deadline:
     try:
-        obj = json.loads(line.strip())
-        for block in obj.get('message', {}).get('content', []):
-            if block.get('type') == 'tool_use':
-                tool_name = block.get('name', '')
-                # MCP Slack tool
-                if 'add_message' in tool_name or 'send_message' in tool_name:
-                    sys.exit(0)  # Already replied via MCP
-                # Direct Slack API post via Bash tool
-                if tool_name == 'Bash':
-                    cmd = block.get('input', {}).get('command', '')
-                    if 'chat.postMessage' in cmd and thread_ts in cmd:
-                        sys.exit(0)  # Already replied via direct API
-    except Exception:
-        pass
-
-# Find the last assistant text message
-last_text = ''
-for line in lines:
-    try:
-        obj = json.loads(line.strip())
-        if obj.get('type') == 'assistant':
-            texts = [
-                b['text']
-                for b in obj.get('message', {}).get('content', [])
-                if b.get('type') == 'text' and b.get('text', '').strip()
-            ]
-            if texts:
-                last_text = '\n'.join(texts)
-    except Exception:
-        pass
-
-if not last_text.strip():
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        break
+    except FileExistsError:
+        time.sleep(0.025)
+if lock_fd is None:
     sys.exit(1)
 
-# Convert markdown → Slack mrkdwn using the shared converter script
-import subprocess
-_converter = os.path.expanduser('~/.claude/skills/slack-markdown/scripts/md-to-mrkdwn.py')
 try:
-    _result = subprocess.run(
-        ['python3', _converter],
-        input=last_text, capture_output=True, text=True, timeout=5
-    )
-    converted_text = _result.stdout if _result.returncode == 0 else last_text
-except Exception:
-    converted_text = last_text
+    raw = json.load(open(PENDING_FILE))
+    queue = raw if isinstance(raw, list) else [raw]
+    if len(queue) == 0:
+        os.remove(PENDING_FILE)
+        sys.exit(1)
+    if not isinstance(queue[0], dict):
+        sys.exit(1)
+    ctx = queue.pop(0)  # Pop oldest, but commit only after verified success
+    channel = ctx.get('channel', '')
+    thread_ts = ctx.get('thread_ts', '')
+    if not channel or not thread_ts:
+        sys.exit(1)
 
-# Output JSON payload for Slack
-payload = {
-    'channel': channel,
-    'thread_ts': thread_ts,
-    'text': converted_text[:3000],
-}
-print(json.dumps(payload))
+    def commit_removal():
+        if queue:
+            with open(PENDING_FILE, 'w') as f:
+                json.dump(queue, f)
+        else:
+            os.remove(PENDING_FILE)
+
+    # Already replied via MCP or direct API this turn?
+    for line in lines[-50:]:
+        try:
+            obj = json.loads(line.strip())
+            for block in obj.get('message', {}).get('content', []):
+                if block.get('type') == 'tool_use':
+                    tool_name = block.get('name', '')
+                    if 'add_message' in tool_name or 'send_message' in tool_name:
+                        commit_removal()
+                        sys.exit(0)
+                    if tool_name == 'Bash':
+                        cmd = block.get('input', {}).get('command', '')
+                        if 'chat.postMessage' in cmd and thread_ts in cmd:
+                            commit_removal()
+                            sys.exit(0)
+        except Exception:
+            pass
+
+    last_text = ''
+    for line in lines:
+        try:
+            obj = json.loads(line.strip())
+            if obj.get('type') == 'assistant':
+                texts = [
+                    b['text']
+                    for b in obj.get('message', {}).get('content', [])
+                    if b.get('type') == 'text' and b.get('text', '').strip()
+                ]
+                if texts:
+                    last_text = '\n'.join(texts)
+        except Exception:
+            pass
+
+    if not last_text.strip():
+        commit_removal()
+        sys.exit(1)
+
+    _converter = os.path.expanduser('~/.claude/skills/slack-markdown/scripts/md-to-mrkdwn.py')
+    try:
+        _result = subprocess.run(
+            ['python3', _converter],
+            input=last_text, capture_output=True, text=True, timeout=5
+        )
+        converted_text = _result.stdout if _result.returncode == 0 else last_text
+    except Exception:
+        converted_text = last_text
+
+    payload = {
+        'channel': channel,
+        'thread_ts': thread_ts,
+        'text': converted_text[:3000],
+    }
+
+    bridge_dir = os.path.expanduser('~/Downloads/projects/tmux-slack-bridge')
+    npx_candidate = os.path.expanduser('~/.nvm/versions/node/v22.13.1/bin/npx')
+    npx_bin = npx_candidate if os.path.isfile(npx_candidate) and os.access(npx_candidate, os.X_OK) else 'npx'
+    try:
+        proc = subprocess.run(
+            [npx_bin, '--no-install', 'tsx', 'scripts/post-and-record-slack-reply.ts'],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=60,
+            cwd=bridge_dir, env=os.environ.copy()
+        )
+        ok = proc.returncode == 0
+    except Exception:
+        ok = False
+
+    if ok:
+        commit_removal()
+    else:
+        queue.insert(0, ctx)
+        with open(PENDING_FILE, 'w') as f:
+            json.dump(queue, f)
+    sys.exit(0 if ok else 1)
+finally:
+    os.close(lock_fd)
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
 PYEOF
 )
 
-EXIT_CODE=$?
-
-# Exit code 0 from Python means "already replied" (sys.exit(0) in the check above)
-# Exit code 1 means "not replied, no payload" — clean up and exit
-# If we got a payload (non-empty SLACK_PAYLOAD), post it
-
-if [ $EXIT_CODE -ne 0 ] || [ -z "$SLACK_PAYLOAD" ]; then
-  # Queue was already updated by Python (popped entry + wrote remaining)
-  # Only clean up if Python exited with error (didn't get to pop)
-  exit 0
-fi
-
-BRIDGE_DIR="$HOME/Downloads/projects/tmux-slack-bridge"
-if [ -d "$BRIDGE_DIR" ]; then
-  (
-    cd "$BRIDGE_DIR" || exit 0
-    NPX_BIN="${BRIDGE_NPX_BIN:-$HOME/.nvm/versions/node/v22.13.1/bin/npx}"
-    [ -x "$NPX_BIN" ] || NPX_BIN="npx"
-    printf '%s' "$SLACK_PAYLOAD" \
-      | "$NPX_BIN" --no-install tsx scripts/post-and-record-slack-reply.ts
-  ) >/dev/null 2>&1 || true
-fi
-
-# Queue was already updated by Python (popped entry, wrote remaining or deleted file)
+# Queue commit/restore is already handled under the lock. Keep the hook exit
+# neutral so a transient post failure does not surface as a Claude error.
 exit 0

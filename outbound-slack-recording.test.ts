@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { existsSync, readFileSync, unlinkSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from "fs";
+import { join, resolve } from "path";
 import { tmpdir } from "os";
 import { spawnSync } from "child_process";
 import Database from "better-sqlite3";
@@ -128,14 +128,15 @@ describe("verified outbound Slack recording", () => {
         ts: "1787000000.000200",
       })
     ).toBe(true);
-    // Replaying the exact same Slack message (same channel/ts) must not insert.
+    // Replaying the exact same Slack message (same channel/ts) is idempotent:
+    // the row already exists and the replay is still a verified success.
     expect(
       persistVerifiedOutboundSlackMessage(payload, {
         ok: true,
         channel: "C0OUTBOUND",
         ts: "1787000000.000200",
       })
-    ).toBe(false);
+    ).toBe(true);
     // A distinct Slack message with the same body is a different message and
     // must not be suppressed by a body-based delivery key.
     expect(
@@ -147,6 +148,39 @@ describe("verified outbound Slack recording", () => {
     ).toBe(true);
 
     expect(countRows(text)).toBe(2);
+  });
+
+  test("postAndRecordSlackReply CLI exits nonzero without a bridge token", () => {
+    const cliDir = mkdtempSync(join(tmpdir(), "bridge-outbound-cli-token-"));
+    const cliDb = join(tmpdir(), `bridge-outbound-cli-token-${Date.now()}.db`);
+    const payload = JSON.stringify({
+      channel: "C0OUTBOUND",
+      thread_ts: "1786941665.403559",
+      text: "bridge obligation 752 no token",
+    });
+    try {
+      const result = spawnSync(
+        "npx",
+        [
+          "--no-install",
+          "tsx",
+          resolve(process.cwd(), "scripts/post-and-record-slack-reply.ts"),
+        ],
+        {
+          cwd: cliDir,
+          env: { ...process.env, DB_PATH: cliDb },
+          input: payload,
+          encoding: "utf8",
+        }
+      );
+      expect(result.status).toBe(2);
+      expect(existsSync(cliDb)).toBe(false);
+    } finally {
+      rmSync(cliDir, { recursive: true, force: true });
+      if (existsSync(cliDb)) unlinkSync(cliDb);
+      if (existsSync(`${cliDb}-shm`)) unlinkSync(`${cliDb}-shm`);
+      if (existsSync(`${cliDb}-wal`)) unlinkSync(`${cliDb}-wal`);
+    }
   });
 
   test("CLI records from stdin without payload or response environment variables", () => {
