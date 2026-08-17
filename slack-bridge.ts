@@ -95,7 +95,9 @@ function markSeen(channel: string, ts: string) {
 function latestRecordedTs(channel: string): string | null {
   try {
     const row = getDb()
-      .prepare("SELECT ts FROM messages WHERE channel_id = ? ORDER BY CAST(ts AS REAL) DESC LIMIT 1")
+      .prepare(
+        "SELECT ts FROM messages WHERE channel_id = ? AND direction = 'inbound' ORDER BY CAST(ts AS REAL) DESC LIMIT 1"
+      )
       .get(channel) as { ts?: string | null } | undefined;
     return row?.ts || null;
   } catch (err: any) {
@@ -335,7 +337,7 @@ export async function sendToPane(text: string, target?: string) {
   const pmBusy = pane === "0:0.0" ? await pmBusyState() : null;
   const submitKey = resolveSubmitKey(pane, pmBusy);
   execSync(
-    `tmux send-keys -t ${pane} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${pane} ${submitKey}`,
+    `tmux send-keys -t ${pane} -l ${escaped} && sleep 1 && tmux send-keys -t ${pane} ${submitKey}`,
     { timeout: 5000 }
   );
   log(`✅ sendToPane ${pane} submit=${submitKey} pm_busy=${pmBusy === null ? "unknown" : pmBusy}`);
@@ -607,19 +609,15 @@ async function handleSlackMessage(
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    // Append to inject queue — channel + thread_ts of the forwarded message.
-    // Uses a FIFO queue (array) so multiple rapid messages don't overwrite each other.
-    // The Stop hook (reply-to-slack.sh) pops the oldest entry when replying.
-    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
-    const queue = existsSync(QUEUE_FILE)
-      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
-      : [];
-    queue.push({ channel: msg.channel, thread_ts: threadTs });
-    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
-
-    // Record in SQLite — use effectiveUserId for bot messages (bot_id fallback)
+    // Record in SQLite — use effectiveUserId for bot messages (bot_id fallback).
+    // recordMessage is the atomic dedup claim: two handlers that both pass the
+    // wasRecorded() fast-path (socket vs poll, or a duplicate process) race on
+    // INSERT OR IGNORE, and only the winner (changes === 1) may forward. DB
+    // write failure fails open (message still routes once) to preserve the
+    // pre-existing delivery guarantee.
+    let claimed = false;
     try {
-      recordMessage({
+      claimed = recordMessage({
         ts: msg.ts,
         threadTs: isThreaded ? msg.thread_ts! : null,
         channelId: msg.channel,
@@ -630,10 +628,27 @@ async function handleSlackMessage(
         hasImages: imagePaths.length > 0,
         hasSnippets: snippets.length > 0,
       });
-      markSeen(msg.channel, msg.ts);
+      if (claimed) markSeen(msg.channel, msg.ts);
     } catch (dbErr: any) {
       log(`⚠️ DB record error: ${dbErr.message}`);
+      claimed = true;
     }
+    if (!claimed) {
+      log(
+        `↩️ Skipped duplicate ${source} message ${msg.channel}/${msg.ts} (record claim lost)`
+      );
+      return false;
+    }
+
+    // Append to inject queue only after the DB claim succeeds. This queue is
+    // outbound reply context for the PM Stop hook; duplicate inbound events that
+    // lose the claim must not leave stale reply targets behind.
+    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
+    const queue = existsSync(QUEUE_FILE)
+      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
+      : [];
+    queue.push({ channel: msg.channel, thread_ts: threadTs });
+    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
 
     // Append to shared channel log files (slots / PM can read anytime)
     if (msg.channel === HEYDONNA_DEV_CHANNEL) {
@@ -767,16 +782,12 @@ app.event("app_mention", async ({ event, client }) => {
 
     const fullMessage = parts.filter(Boolean).join("\n");
 
-    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
-    const queue = existsSync(QUEUE_FILE)
-      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
-      : [];
-    queue.push({ channel: event.channel, thread_ts: threadTs });
-    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
-
-    // Record in SQLite
+    // Record in SQLite. The atomic claim also guards this path so a replayed
+    // app_mention (socket redelivery, duplicate instance) is never forwarded
+    // twice. DB write failure fails open (still forwards once).
+    let claimed = false;
     try {
-      recordMessage({
+      claimed = recordMessage({
         ts: event.ts,
         threadTs: isThreaded ? event.thread_ts! : null,
         channelId: event.channel,
@@ -789,7 +800,21 @@ app.event("app_mention", async ({ event, client }) => {
       });
     } catch (dbErr: any) {
       log(`⚠️ DB record error: ${dbErr.message}`);
+      claimed = true;
     }
+    if (!claimed) {
+      log(
+        `↩️ Skipped duplicate @mention ${event.channel}/${event.ts} (record claim lost)`
+      );
+      return;
+    }
+
+    const QUEUE_FILE = "/tmp/slack-bridge-last-inject.json";
+    const queue = existsSync(QUEUE_FILE)
+      ? (() => { try { const d = JSON.parse(readFileSync(QUEUE_FILE, "utf8")); return Array.isArray(d) ? d : [d]; } catch { return []; } })()
+      : [];
+    queue.push({ channel: event.channel, thread_ts: threadTs });
+    writeFileSync(QUEUE_FILE, JSON.stringify(queue));
 
     await sendToPane(fullMessage);
     log(`✅ @mention forwarded to ${TMUX_TARGET}`);

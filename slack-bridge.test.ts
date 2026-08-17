@@ -57,6 +57,7 @@ globalThis.fetch = async () => { throw new Error("No network in test"); };
 // can start the bridge with the real local .env during tests.
 let getDb: typeof import("./db.ts").getDb;
 let recordMessage: typeof import("./db.ts").recordMessage;
+let recordOutboundMessage: typeof import("./db.ts").recordOutboundMessage;
 let closeDb: typeof import("./db.ts").closeDb;
 let wasRecorded: typeof import("./slack-bridge.ts").wasRecorded;
 let markSeen: typeof import("./slack-bridge.ts").markSeen;
@@ -68,6 +69,7 @@ describe("crash-recovery watermark guard (#4984)", () => {
     const bridge = await import("./slack-bridge.ts");
     getDb = db.getDb;
     recordMessage = db.recordMessage;
+    recordOutboundMessage = db.recordOutboundMessage;
     closeDb = db.closeDb;
     wasRecorded = bridge.wasRecorded;
     markSeen = bridge.markSeen;
@@ -125,6 +127,22 @@ describe("crash-recovery watermark guard (#4984)", () => {
     expect(latestRecordedTs(ch)).toBe("100.003");
   });
 
+  test("latestRecordedTs ignores outbound rows so poller watermark stays inbound", () => {
+    const ch = channelId();
+    record(ch, "150.001", "inbound");
+    recordOutboundMessage({
+      ts: "150.999",
+      threadTs: "150.001",
+      channelId: ch,
+      channelType: "channel",
+      userId: "U0BRIDGE",
+      userName: "Bridge Bot",
+      body: "outbound reply",
+    });
+
+    expect(latestRecordedTs(ch)).toBe("150.001");
+  });
+
   test("crash mid-batch: unrecorded messages not in DB, not skipped", () => {
     const ch = channelId();
 
@@ -170,5 +188,48 @@ describe("crash-recovery watermark guard (#4984)", () => {
     record(ch, "400.001", "original");
     // Same ts arrives again via socket reconnect
     expect(wasRecorded(ch, "400.001")).toBe(true);
+  });
+
+  test("recordMessage atomically claims a (channel, ts) exactly once", () => {
+    const ch = channelId();
+    const first = recordMessage({
+      ts: "500.001",
+      threadTs: null,
+      channelId: ch,
+      channelType: "channel",
+      userId: "U0TEST",
+      userName: "Tester",
+      body: "claim-1",
+      hasImages: false,
+      hasSnippets: false,
+    });
+    // A concurrent socket/poll handler that both passed wasRecorded() races
+    // here; the loser must get false and therefore must not forward.
+    const second = recordMessage({
+      ts: "500.001",
+      threadTs: null,
+      channelId: ch,
+      channelType: "channel",
+      userId: "U0TEST",
+      userName: "Tester",
+      body: "claim-2-duplicate",
+      hasImages: false,
+      hasSnippets: false,
+    });
+    // A different message is a fresh claim.
+    const third = recordMessage({
+      ts: "500.002",
+      threadTs: null,
+      channelId: ch,
+      channelType: "channel",
+      userId: "U0TEST",
+      userName: "Tester",
+      body: "claim-3",
+      hasImages: false,
+      hasSnippets: false,
+    });
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    expect(third).toBe(true);
   });
 });

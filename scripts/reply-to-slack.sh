@@ -175,10 +175,24 @@ if [ -z "$SLACK_TOKEN" ]; then
 fi
 
 # Post to Slack
-curl -s -X POST https://slack.com/api/chat.postMessage \
+SLACK_POST_RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
   -H "Authorization: Bearer $SLACK_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$CURL_PAYLOAD" > /dev/null 2>&1
+  -d "$CURL_PAYLOAD" 2>/dev/null)
+
+# Persist only verified successful Slack sends. Failed sends intentionally write
+# no outbound row so closure checks cannot falsely pass.
+if [ -n "$SLACK_POST_RESPONSE" ]; then
+  BRIDGE_DIR="$HOME/Downloads/projects/tmux-slack-bridge"
+  if [ -d "$BRIDGE_DIR" ]; then
+    (
+      cd "$BRIDGE_DIR" || exit 0
+      SLACK_POST_PAYLOAD="$CURL_PAYLOAD" \
+      SLACK_POST_RESPONSE="$SLACK_POST_RESPONSE" \
+        npx --no-install tsx scripts/record-outbound-slack-message.ts
+    ) >/dev/null 2>&1 || true
+  fi
+fi
 
 # Queue was already updated by Python (popped entry, wrote remaining or deleted file)
 exit 0

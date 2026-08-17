@@ -2,7 +2,8 @@
  * SQLite database for tracking Slack messages, threads, and replies.
  *
  * Schema:
- * - messages: Every message forwarded through the bridge (inbound from Slack)
+ * - messages: Every message forwarded through the bridge (inbound from Slack,
+ *   outbound to Slack)
  * - threads: Thread-level metadata (topic, status, message count)
  *
  * Used by:
@@ -49,6 +50,7 @@ export function getDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+    CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction);
 
     CREATE TABLE IF NOT EXISTS threads (
       thread_ts TEXT NOT NULL,
@@ -78,6 +80,65 @@ export function getDb(): Database.Database {
     );
   `);
 
+  // Dedup migration (2026-08-11 duplicate-injection fix): older databases
+  // predate the unique (channel_id, ts) contract and contain duplicate rows
+  // written by the check-then-insert race (socket vs poll / dual instances).
+  // Keep the earliest row per (channel_id, ts), then enforce uniqueness so
+  // `INSERT OR IGNORE` can act as the atomic claim going forward.
+  const duplicateRows = _db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM (
+         SELECT 1 FROM messages GROUP BY channel_id, ts HAVING COUNT(*) > 1
+       )`
+    )
+    .get() as { c: number };
+  if (duplicateRows.c > 0) {
+    const removed = _db
+      .prepare(
+        `DELETE FROM messages
+         WHERE id NOT IN (SELECT MIN(id) FROM messages GROUP BY channel_id, ts)`
+      )
+      .run();
+    console.warn(
+      `[db] dedup migration removed ${removed.changes} duplicate message row(s)`
+    );
+  }
+  _db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_channel_ts ON messages(channel_id, ts)"
+  );
+
+  const duplicateOutboundRows = _db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM (
+         SELECT 1 FROM messages
+         WHERE direction = 'outbound'
+         GROUP BY channel_id, COALESCE(thread_ts, ''), body
+         HAVING COUNT(*) > 1
+       )`
+    )
+    .get() as { c: number };
+  if (duplicateOutboundRows.c > 0) {
+    const removed = _db
+      .prepare(
+        `DELETE FROM messages
+         WHERE direction = 'outbound'
+           AND id NOT IN (
+             SELECT MIN(id) FROM messages
+             WHERE direction = 'outbound'
+             GROUP BY channel_id, COALESCE(thread_ts, ''), body
+           )`
+      )
+      .run();
+    console.warn(
+      `[db] outbound dedup migration removed ${removed.changes} duplicate message row(s)`
+    );
+  }
+  _db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_outbound_delivery_key
+    ON messages(channel_id, COALESCE(thread_ts, ''), body)
+    WHERE direction = 'outbound'
+  `);
+
   return _db;
 }
 
@@ -94,12 +155,16 @@ export function recordMessage(params: {
   body: string;
   hasImages: boolean;
   hasSnippets: boolean;
-}) {
+}): boolean {
   const db = getDb();
 
-  // Insert the message
-  db.prepare(`
-    INSERT INTO messages (ts, thread_ts, channel_id, channel_type, user_id, user_name, body, has_images, has_snippets)
+  // Atomic claim: INSERT OR IGNORE + the unique (channel_id, ts) index means
+  // exactly one caller wins per Slack message. `changes === 1` is the claim;
+  // a second socket/poll/instance handler for the same message loses here
+  // instead of after a SELECT race. The thread upsert only runs on a claim so
+  // duplicate deliveries never double-count thread activity.
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO messages (ts, thread_ts, channel_id, channel_type, user_id, user_name, body, has_images, has_snippets)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     params.ts,
@@ -112,6 +177,7 @@ export function recordMessage(params: {
     params.hasImages ? 1 : 0,
     params.hasSnippets ? 1 : 0
   );
+  if (insert.changes !== 1) return false;
 
   // Upsert the thread
   const effectiveThreadTs = params.threadTs || params.ts;
@@ -139,6 +205,38 @@ export function recordMessage(params: {
       params.body.slice(0, 200)
     );
   }
+
+  return true;
+}
+
+/**
+ * Record a verified outbound message after Slack has accepted chat.postMessage.
+ */
+export function recordOutboundMessage(params: {
+  ts: string;
+  threadTs: string | null;
+  channelId: string;
+  channelType: "dm" | "channel";
+  userId: string;
+  userName: string;
+  body: string;
+}): boolean {
+  const db = getDb();
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO messages
+      (ts, thread_ts, channel_id, channel_type, user_id, user_name, direction, body, has_images, has_snippets)
+    VALUES (?, ?, ?, ?, ?, ?, 'outbound', ?, 0, 0)
+  `).run(
+    params.ts,
+    params.threadTs,
+    params.channelId,
+    params.channelType,
+    params.userId,
+    params.userName,
+    params.body
+  );
+
+  return insert.changes === 1;
 }
 
 /**
@@ -155,6 +253,7 @@ export function searchMessages(params: {
   thread_ts: string | null;
   channel_id: string;
   channel_type: string;
+  direction: string;
   user_name: string;
   body: string;
   created_at: string;
@@ -184,7 +283,7 @@ export function searchMessages(params: {
   const limit = params.limit || 20;
 
   return db.prepare(`
-    SELECT ts, thread_ts, channel_id, channel_type, user_name, body, created_at
+    SELECT ts, thread_ts, channel_id, channel_type, direction, user_name, body, created_at
     FROM messages
     ${where}
     ORDER BY created_at DESC
@@ -247,6 +346,7 @@ export function listThreads(params: {
 export function getThreadMessages(threadTs: string, channelId?: string): Array<{
   ts: string;
   channel_id: string;
+  direction: string;
   user_name: string;
   body: string;
   created_at: string;
@@ -255,7 +355,7 @@ export function getThreadMessages(threadTs: string, channelId?: string): Array<{
 
   if (channelId) {
     return db.prepare(`
-      SELECT ts, channel_id, user_name, body, created_at
+      SELECT ts, channel_id, direction, user_name, body, created_at
       FROM messages
       WHERE thread_ts = ? AND channel_id = ?
       ORDER BY created_at ASC
@@ -263,7 +363,7 @@ export function getThreadMessages(threadTs: string, channelId?: string): Array<{
   }
 
   return db.prepare(`
-    SELECT ts, channel_id, user_name, body, created_at
+    SELECT ts, channel_id, direction, user_name, body, created_at
     FROM messages
     WHERE thread_ts = ?
     ORDER BY created_at ASC
