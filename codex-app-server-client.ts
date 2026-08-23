@@ -15,10 +15,25 @@ export type AppServerDeliveryRequest = {
   destinationThreadId: string;
   consumerSopPath: string;
   routedWakeText: string;
+  receiptKey: string;
+  fingerprint: string;
+};
+
+export type WakeTerminalReceipt = {
+  key: string;
+  fingerprint: string;
+  slack_reply_ts: string | null;
+  slack_suppressed: boolean;
 };
 
 export type AppServerDeliveryResult =
-  | { status: "delivered"; threadId: string; turnId: string; terminal: Record<string, unknown> }
+  | {
+      status: "delivered";
+      threadId: string;
+      turnId: string;
+      terminal: Record<string, unknown>;
+      wakeReceipt: WakeTerminalReceipt;
+    }
   | { status: "pending"; detail: string }
   | { status: "unavailable"; detail: string }
   | { status: "uncertain"; detail: string; threadId: string; turnId?: string };
@@ -77,16 +92,20 @@ export class CodexAppServerClient {
         cwd: request.cwd,
         ephemeral: true,
         approvalPolicy: "never",
-        sandbox: "workspace-write",
+        sandbox: "danger-full-access",
         threadSource: `cto-slack-relay:${request.project}`,
         developerInstructions: [
-          `Follow the consumer SOP at ${request.consumerSopPath}.`,
-          `This relay must deliver the routed wake to destination task ${request.destinationThreadId}.`,
-          "Use codex_app__send_message_to_thread exactly once with hostId=local and the destination threadId.",
-          "Send the complete routed wake text as the prompt; do not reinterpret or summarize it.",
-          "Do not post to Slack and do not acknowledge the source event yourself.",
-          "After the app tool returns an accepted receipt, emit RELAY_DELIVERY_ACCEPTED with the tool receipt.",
-          "If the app tool fails or is uncertain, emit RELAY_DELIVERY_FAILED and do not claim acceptance.",
+          "You are the ephemeral receiving CTO task for exactly one admitted Slack wake, not a mechanical relay.",
+          `Read and obey the complete consumer SOP at ${request.consumerSopPath} before acting.`,
+          `The durable destination identity is ${request.destinationThreadId}; preserve all owner and return-task contracts named by the SOP.`,
+          "Read and obey the workspace AGENTS.md. Process the routed wake directly to its bounded terminal action.",
+          "Do not call codex_app__send_message_to_thread: that Desktop-only tool is unavailable in app-server turns.",
+          "Use the SOP's exact Slack identity/threading/read-back contract for any material reply, and suppress Slack only when the SOP requires silence.",
+          `Before finalizing, append a WAKE_CONSUMED row to the consumer ledger with bridge_dedup_key=${request.receiptKey} and bridge_fingerprint=${request.fingerprint}.`,
+          "After the action, Slack verification (or authorized suppression), and ledger write all succeed, emit exactly one final receipt line:",
+          `For a verified reply: RELAY_WAKE_CONSUMED {"key":${JSON.stringify(request.receiptKey)},"fingerprint":${JSON.stringify(request.fingerprint)},"slack_reply_ts":"1787000000.000001","slack_suppressed":false}`,
+          `For authorized silence: RELAY_WAKE_CONSUMED {"key":${JSON.stringify(request.receiptKey)},"fingerprint":${JSON.stringify(request.fingerprint)},"slack_reply_ts":null,"slack_suppressed":true}`,
+          "If any required terminal step is blocked or uncertain, emit RELAY_WAKE_FAILED with the typed blocker and do not emit RELAY_WAKE_CONSUMED.",
         ].join("\n"),
       });
       threadId = readNestedId(threadResponse.result, "thread");
@@ -105,8 +124,13 @@ export class CodexAppServerClient {
 
       const terminal = await completion;
       const status = terminal.status;
-      if (status === "completed" && JSON.stringify(terminal).includes("RELAY_DELIVERY_ACCEPTED")) {
-        return { status: "delivered", threadId, turnId, terminal };
+      const wakeReceipt = readWakeTerminalReceipt(terminal);
+      if (
+        status === "completed" &&
+        wakeReceipt?.key === request.receiptKey &&
+        wakeReceipt.fingerprint === request.fingerprint
+      ) {
+        return { status: "delivered", threadId, turnId, terminal, wakeReceipt };
       }
       if (status === "failed" || status === "interrupted") {
         return { status: "uncertain", threadId, turnId, detail: `turn-${String(status)}` };
@@ -256,4 +280,46 @@ function readNestedId(result: Record<string, unknown> | undefined, field: string
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const id = (value as Record<string, unknown>).id;
   return typeof id === "string" ? id : "";
+}
+
+function readWakeTerminalReceipt(terminal: Record<string, unknown>): WakeTerminalReceipt | null {
+  const lines = collectStrings(terminal).flatMap((value) => value.split("\n"));
+  for (const line of lines) {
+    const prefix = "RELAY_WAKE_CONSUMED ";
+    const index = line.indexOf(prefix);
+    if (index < 0) continue;
+    try {
+      const parsed = JSON.parse(line.slice(index + prefix.length).trim()) as Record<string, unknown>;
+      const key = parsed.key;
+      const fingerprint = parsed.fingerprint;
+      const slackReplyTs = parsed.slack_reply_ts;
+      const slackSuppressed = parsed.slack_suppressed;
+      if (
+        typeof key !== "string" ||
+        typeof fingerprint !== "string" ||
+        (typeof slackReplyTs !== "string" && slackReplyTs !== null) ||
+        typeof slackSuppressed !== "boolean" ||
+        (slackSuppressed && slackReplyTs !== null) ||
+        (!slackSuppressed && typeof slackReplyTs !== "string")
+      ) {
+        continue;
+      }
+      return {
+        key,
+        fingerprint,
+        slack_reply_ts: slackReplyTs as string | null,
+        slack_suppressed: slackSuppressed,
+      };
+    } catch {
+      // A malformed model receipt is not delivery authority.
+    }
+  }
+  return null;
+}
+
+function collectStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(collectStrings);
+  if (!value || typeof value !== "object") return [];
+  return Object.values(value as Record<string, unknown>).flatMap(collectStrings);
 }

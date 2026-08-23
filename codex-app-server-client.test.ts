@@ -55,7 +55,13 @@ describe("Codex app-server transport", () => {
             method: "turn/completed",
             params: {
               threadId: "thread-1",
-              turn: { id: "turn-1", status: "completed", items: [{ text: "RELAY_DELIVERY_ACCEPTED" }] },
+              turn: {
+                id: "turn-1",
+                status: "completed",
+                items: [{
+                  text: 'RELAY_WAKE_CONSUMED {"key":"C1:1","fingerprint":"fp-1","slack_reply_ts":"2.0","slack_suppressed":false}',
+                }],
+              },
             },
           });
         }
@@ -70,9 +76,19 @@ describe("Codex app-server transport", () => {
       destinationThreadId: "destination-1",
       consumerSopPath: "/tmp/hey-sop.md",
       routedWakeText: "SOP path: /tmp/hey-sop.md\n\nsource",
+      receiptKey: "C1:1",
+      fingerprint: "fp-1",
     });
 
     expect(result).toMatchObject({ status: "delivered", threadId: "thread-1", turnId: "turn-1" });
+    expect(result).toMatchObject({
+      wakeReceipt: {
+        key: "C1:1",
+        fingerprint: "fp-1",
+        slack_reply_ts: "2.0",
+        slack_suppressed: false,
+      },
+    });
     expect(methods).toEqual(["initialize", "thread/start", "turn/start"]);
     client.stop();
   });
@@ -100,6 +116,8 @@ describe("Codex app-server transport", () => {
       destinationThreadId: "destination-2",
       consumerSopPath: "/tmp/godavari-sop.md",
       routedWakeText: "SOP path: /tmp/godavari-sop.md\n\nsource",
+      receiptKey: "C2:2",
+      fingerprint: "fp-2",
     });
 
     expect(result).toMatchObject({ status: "uncertain", threadId: "thread-2", turnId: "turn-2" });

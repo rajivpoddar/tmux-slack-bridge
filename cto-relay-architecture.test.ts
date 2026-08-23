@@ -47,11 +47,16 @@ describe("CTO Slack relay architecture", () => {
     expect(APP_SERVER_SOURCE).toContain('this.request("thread/start"');
     expect(APP_SERVER_SOURCE).toContain("ephemeral: true");
     expect(APP_SERVER_SOURCE).toContain('this.request("turn/start"');
+    expect(APP_SERVER_SOURCE).toContain("ephemeral receiving CTO task");
+    expect(APP_SERVER_SOURCE).toContain("Do not call codex_app__send_message_to_thread");
+    expect(APP_SERVER_SOURCE).toContain("RELAY_WAKE_CONSUMED");
     expect(BRIDGE_SOURCE).toContain('updateClaim("renew"');
     expect(BRIDGE_SOURCE).toContain('updateClaim("release"');
     expect(BRIDGE_SOURCE).toContain("claim_owner");
     expect(BRIDGE_SOURCE).toContain("codex_desktop_ipc_fallback");
     expect(BRIDGE_SOURCE).toContain("APP_SERVER_DELIVERY_RECEIPTS_FILE");
+    expect(BRIDGE_SOURCE).toContain("verifyConsumerTerminal");
+    expect(BRIDGE_SOURCE).toContain("bridge_dedup_key");
     expect(BRIDGE_SOURCE).not.toContain("no-client-found");
     expect(BRIDGE_SOURCE).toContain("pending.sort(compareSourceOrder)");
   });

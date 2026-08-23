@@ -45,6 +45,10 @@ const RELAY_LOCK_FILE = "/tmp/cto-slack-relay.lock";
 const RELAY_HEARTBEAT_FILE = "/tmp/cto-slack-relay-heartbeat";
 const CLAIM_TTL_SECONDS = 120;
 const CLAIM_RENEW_INTERVAL_MS = 30_000;
+const HEYDONNA_LEDGER_FILE =
+  "/Users/rajiv/.codex/monitors/heydonna-pm-chat/processed-wake-ledger.jsonl";
+const GODAVARI_LEDGER_FILE =
+  "/Users/rajiv/.codex/monitors/godavari-run-readiness/processed-wake-ledger.jsonl";
 const SLACK_MONITOR_THREAD_ID = "019fd9df-23ad-7500-8b3e-53ce9341a140";
 const SLACK_MONITOR_SOP = "/Users/rajiv/.codex/monitors/cto-slack-relay/WAKE_SOP.md";
 const MAX_SEEN = 5_000;
@@ -379,6 +383,7 @@ function acknowledgeEnvelope(envelope: RoutedEnvelope): void {
 function appendAppServerReceipt(
   envelope: RoutedEnvelope,
   result: AppServerDeliveryResult,
+  verification?: Record<string, unknown>,
 ): void {
   appendReceipt(APP_SERVER_DELIVERY_RECEIPTS_FILE, {
     receipt_key: envelope.dedup_key,
@@ -388,8 +393,77 @@ function appendAppServerReceipt(
     destination_thread_id: envelope.relay_route.destination_thread_id,
     ...result,
     status: result.status === "delivered" ? "delivered" : "uncertain",
+    ...(verification ? { verification } : {}),
     recorded_at: new Date().toISOString(),
   });
+}
+
+function consumerLedgerPath(project: RelayRoute["project"]): string {
+  return project === "heydonna" ? HEYDONNA_LEDGER_FILE : GODAVARI_LEDGER_FILE;
+}
+
+function hasConsumerLedgerReceipt(envelope: RoutedEnvelope): boolean {
+  const ledgerPath = consumerLedgerPath(envelope.relay_route.project);
+  if (!existsSync(ledgerPath)) return false;
+  try {
+    const lines = readFileSync(ledgerPath, "utf8").split("\n").filter(Boolean);
+    return lines.some((line) => {
+      try {
+        const row = JSON.parse(line) as Record<string, unknown>;
+        return (
+          row.bridge_dedup_key === envelope.dedup_key &&
+          row.bridge_fingerprint === envelope.fingerprint &&
+          row.ack === "WAKE_CONSUMED"
+        );
+      } catch {
+        return false;
+      }
+    });
+  } catch (error) {
+    log(`consumer-ledger-read-failure path=${ledgerPath} error=${formatError(error)}`);
+    return false;
+  }
+}
+
+async function hasVerifiedSlackReply(
+  envelope: RoutedEnvelope,
+  replyTs: string,
+): Promise<boolean> {
+  const tuple = envelope.exact_tuple;
+  if (!tuple || typeof tuple !== "object" || Array.isArray(tuple) || !appUserId) return false;
+  const record = tuple as Record<string, unknown>;
+  const channel = String(record.channel ?? "");
+  const sourceTs = String(record.ts ?? "");
+  const sourceThreadTs = typeof record.thread_ts === "string" ? record.thread_ts : "";
+  const threadTs = sourceThreadTs || sourceTs;
+  if (!channel || !threadTs) return false;
+  try {
+    const result = await app.client.conversations.replies({
+      channel,
+      ts: threadTs,
+      latest: replyTs,
+      inclusive: true,
+      limit: 20,
+    });
+    return (result.messages ?? []).some(
+      (message) => message.ts === replyTs && message.user === appUserId,
+    );
+  } catch (error) {
+    log(`slack-terminal-readback-failure key=${envelope.dedup_key} error=${formatError(error)}`);
+    return false;
+  }
+}
+
+async function verifyConsumerTerminal(
+  envelope: RoutedEnvelope,
+  result: Extract<AppServerDeliveryResult, { status: "delivered" }>,
+): Promise<{ ok: boolean; ledger: boolean; slack: boolean; slack_suppressed: boolean }> {
+  const ledger = hasConsumerLedgerReceipt(envelope);
+  const slackSuppressed = result.wakeReceipt.slack_suppressed;
+  const slack = slackSuppressed
+    ? true
+    : await hasVerifiedSlackReply(envelope, result.wakeReceipt.slack_reply_ts ?? "");
+  return { ok: ledger && slack, ledger, slack, slack_suppressed: slackSuppressed };
 }
 
 function appendUncertainReceipt(
@@ -470,9 +544,23 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
       destinationThreadId: envelope.relay_route.destination_thread_id,
       consumerSopPath: envelope.relay_route.consumer_sop_path,
       routedWakeText: envelope.routed_wake_text,
+      receiptKey: envelope.dedup_key,
+      fingerprint: envelope.fingerprint,
     });
     if (appServerResult.status === "delivered") {
-      appendAppServerReceipt(envelope, appServerResult);
+      const verification = await verifyConsumerTerminal(envelope, appServerResult);
+      if (!verification.ok) {
+        appendAppServerReceipt(
+          envelope,
+          { ...appServerResult, status: "uncertain", detail: "consumer-terminal-verification-failed" },
+          verification,
+        );
+        log(
+          `relay-app-server-uncertain key=${envelope.dedup_key} detail=consumer-terminal-verification-failed ledger=${verification.ledger} slack=${verification.slack}`,
+        );
+        return "uncertain";
+      }
+      appendAppServerReceipt(envelope, appServerResult, verification);
       acknowledgeEnvelope(envelope);
       await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
       log(
