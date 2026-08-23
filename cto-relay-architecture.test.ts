@@ -25,7 +25,7 @@ afterEach(() => {
 });
 
 describe("CTO Slack relay architecture", () => {
-  test("keeps final task routing out of the Socket Mode bridge", () => {
+  test("keeps route classification out of the Socket Mode bridge", () => {
     expect(BRIDGE_SOURCE).toContain('SLACK_MONITOR_THREAD_ID = "019fd9df-23ad-7500-8b3e-53ce9341a140"');
     expect(BRIDGE_SOURCE).not.toContain("target_thread_id");
     expect(BRIDGE_SOURCE).not.toContain("target_model");
@@ -42,24 +42,23 @@ describe("CTO Slack relay architecture", () => {
     expect(BRIDGE_SOURCE).toContain("MONITOR_TRIGGER_RECEIPTS_FILE");
   });
 
-  test("has a bridge-owned ephemeral app-server delivery path", () => {
+  test("uses app-server only to resume the destination and accept one exact turn", () => {
     expect(BRIDGE_SOURCE).toContain("CodexAppServerClient");
-    expect(APP_SERVER_SOURCE).toContain('this.request("thread/start"');
-    expect(APP_SERVER_SOURCE).toContain("ephemeral: true");
+    expect(APP_SERVER_SOURCE).toContain('this.request("thread/resume"');
     expect(APP_SERVER_SOURCE).toContain('this.request("turn/start"');
-    expect(APP_SERVER_SOURCE).toContain('message.method === "item/completed"');
-    expect(APP_SERVER_SOURCE).toContain("ephemeral receiving CTO task");
-    expect(APP_SERVER_SOURCE).toContain("Do not call codex_app__send_message_to_thread");
-    expect(APP_SERVER_SOURCE).toContain("RELAY_WAKE_CONSUMED");
+    expect(APP_SERVER_SOURCE).not.toContain('this.request("thread/start"');
+    expect(APP_SERVER_SOURCE).not.toContain("ephemeral: true");
+    expect(APP_SERVER_SOURCE).not.toContain("waitForCompletion");
+    expect(APP_SERVER_SOURCE).not.toContain("turn/completed");
     expect(BRIDGE_SOURCE).toContain('updateClaim("renew"');
     expect(BRIDGE_SOURCE).toContain('updateClaim("release"');
     expect(BRIDGE_SOURCE).toContain("claim_owner");
     expect(BRIDGE_SOURCE).toContain("codex_desktop_ipc_fallback");
     expect(BRIDGE_SOURCE).toContain("APP_SERVER_DELIVERY_RECEIPTS_FILE");
-    expect(BRIDGE_SOURCE).toContain("verifyConsumerTerminal");
-    expect(BRIDGE_SOURCE).toContain("bridge_dedup_key");
     expect(BRIDGE_SOURCE).not.toContain("no-client-found");
     expect(BRIDGE_SOURCE).toContain("pending.sort(compareSourceOrder)");
+    expect(BRIDGE_SOURCE).toContain("appServerDrainRequested = true");
+    expect(BRIDGE_SOURCE).not.toContain("verifyConsumerTerminal");
   });
 
   test("puts the complete two-bucket route table in the monitor SOP", () => {

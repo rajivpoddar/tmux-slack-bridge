@@ -2,9 +2,9 @@
  * Durable Slack Socket Mode ingress for the CTO Slack monitor task.
  *
  * This persistent LaunchAgent receives, durably queues, minimally verifies,
- * and wakes one always-loaded relay task over Codex Desktop's private IPC.
- * Final task routing is deliberately absent from this process; the Slack
- * monitor SOP owns it and uses the app-integrated relay for the second hop.
+ * and delivers the frozen routed wake to its existing destination task through
+ * Codex app-server. The Slack-monitor task and its minute heartbeat remain the
+ * definite-not-sent fallback; they are not the normal delivery path.
  */
 import { App } from "@slack/bolt";
 import type { SocketModeReceiver } from "@slack/bolt";
@@ -45,10 +45,6 @@ const RELAY_LOCK_FILE = "/tmp/cto-slack-relay.lock";
 const RELAY_HEARTBEAT_FILE = "/tmp/cto-slack-relay-heartbeat";
 const CLAIM_TTL_SECONDS = 120;
 const CLAIM_RENEW_INTERVAL_MS = 30_000;
-const HEYDONNA_LEDGER_FILE =
-  "/Users/rajiv/.codex/monitors/heydonna-pm-chat/processed-wake-ledger.jsonl";
-const GODAVARI_LEDGER_FILE =
-  "/Users/rajiv/.codex/monitors/godavari-run-readiness/processed-wake-ledger.jsonl";
 const SLACK_MONITOR_THREAD_ID = "019fd9df-23ad-7500-8b3e-53ce9341a140";
 const SLACK_MONITOR_SOP = "/Users/rajiv/.codex/monitors/cto-slack-relay/WAKE_SOP.md";
 const MAX_SEEN = 5_000;
@@ -149,6 +145,7 @@ let shuttingDown = false;
 let reconnectAttempt = 0;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let appServerDrain: Promise<void> | null = null;
+let appServerDrainRequested = false;
 const appServerClient = new CodexAppServerClient();
 
 function remember(key: string): void {
@@ -268,12 +265,6 @@ type RoutedEnvelope = Record<string, unknown> & {
   claim_owner: string;
 };
 
-function routeCwd(project: RelayRoute["project"]): string {
-  if (project === "heydonna") return "/Users/rajiv/Downloads/projects/heydonna-app";
-  if (project === "superproofer") return "/Users/rajiv/Downloads/projects/superproofer";
-  throw new Error(`unsupported-relay-project:${project}`);
-}
-
 function asRoutedEnvelope(value: unknown, claimOwner: string): RoutedEnvelope | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const envelope = value as Record<string, unknown>;
@@ -383,7 +374,6 @@ function acknowledgeEnvelope(envelope: RoutedEnvelope): void {
 function appendAppServerReceipt(
   envelope: RoutedEnvelope,
   result: AppServerDeliveryResult,
-  verification?: Record<string, unknown>,
 ): void {
   appendReceipt(APP_SERVER_DELIVERY_RECEIPTS_FILE, {
     receipt_key: envelope.dedup_key,
@@ -393,77 +383,8 @@ function appendAppServerReceipt(
     destination_thread_id: envelope.relay_route.destination_thread_id,
     ...result,
     status: result.status === "delivered" ? "delivered" : "uncertain",
-    ...(verification ? { verification } : {}),
     recorded_at: new Date().toISOString(),
   });
-}
-
-function consumerLedgerPath(project: RelayRoute["project"]): string {
-  return project === "heydonna" ? HEYDONNA_LEDGER_FILE : GODAVARI_LEDGER_FILE;
-}
-
-function hasConsumerLedgerReceipt(envelope: RoutedEnvelope): boolean {
-  const ledgerPath = consumerLedgerPath(envelope.relay_route.project);
-  if (!existsSync(ledgerPath)) return false;
-  try {
-    const lines = readFileSync(ledgerPath, "utf8").split("\n").filter(Boolean);
-    return lines.some((line) => {
-      try {
-        const row = JSON.parse(line) as Record<string, unknown>;
-        return (
-          row.bridge_dedup_key === envelope.dedup_key &&
-          row.bridge_fingerprint === envelope.fingerprint &&
-          row.ack === "WAKE_CONSUMED"
-        );
-      } catch {
-        return false;
-      }
-    });
-  } catch (error) {
-    log(`consumer-ledger-read-failure path=${ledgerPath} error=${formatError(error)}`);
-    return false;
-  }
-}
-
-async function hasVerifiedSlackReply(
-  envelope: RoutedEnvelope,
-  replyTs: string,
-): Promise<boolean> {
-  const tuple = envelope.exact_tuple;
-  if (!tuple || typeof tuple !== "object" || Array.isArray(tuple) || !appUserId) return false;
-  const record = tuple as Record<string, unknown>;
-  const channel = String(record.channel ?? "");
-  const sourceTs = String(record.ts ?? "");
-  const sourceThreadTs = typeof record.thread_ts === "string" ? record.thread_ts : "";
-  const threadTs = sourceThreadTs || sourceTs;
-  if (!channel || !threadTs) return false;
-  try {
-    const result = await app.client.conversations.replies({
-      channel,
-      ts: threadTs,
-      latest: replyTs,
-      inclusive: true,
-      limit: 20,
-    });
-    return (result.messages ?? []).some(
-      (message) => message.ts === replyTs && message.user === appUserId,
-    );
-  } catch (error) {
-    log(`slack-terminal-readback-failure key=${envelope.dedup_key} error=${formatError(error)}`);
-    return false;
-  }
-}
-
-async function verifyConsumerTerminal(
-  envelope: RoutedEnvelope,
-  result: Extract<AppServerDeliveryResult, { status: "delivered" }>,
-): Promise<{ ok: boolean; ledger: boolean; slack: boolean; slack_suppressed: boolean }> {
-  const ledger = hasConsumerLedgerReceipt(envelope);
-  const slackSuppressed = result.wakeReceipt.slack_suppressed;
-  const slack = slackSuppressed
-    ? true
-    : await hasVerifiedSlackReply(envelope, result.wakeReceipt.slack_reply_ts ?? "");
-  return { ok: ledger && slack, ledger, slack, slack_suppressed: slackSuppressed };
 }
 
 function appendUncertainReceipt(
@@ -539,28 +460,11 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
   renewTimer.unref();
   try {
     const appServerResult = await appServerClient.deliver({
-      project: envelope.relay_route.project,
-      cwd: routeCwd(envelope.relay_route.project),
       destinationThreadId: envelope.relay_route.destination_thread_id,
-      consumerSopPath: envelope.relay_route.consumer_sop_path,
       routedWakeText: envelope.routed_wake_text,
-      receiptKey: envelope.dedup_key,
-      fingerprint: envelope.fingerprint,
     });
     if (appServerResult.status === "delivered") {
-      const verification = await verifyConsumerTerminal(envelope, appServerResult);
-      if (!verification.ok) {
-        appendAppServerReceipt(
-          envelope,
-          { ...appServerResult, status: "uncertain", detail: "consumer-terminal-verification-failed" },
-          verification,
-        );
-        log(
-          `relay-app-server-uncertain key=${envelope.dedup_key} detail=consumer-terminal-verification-failed ledger=${verification.ledger} slack=${verification.slack}`,
-        );
-        return "uncertain";
-      }
-      appendAppServerReceipt(envelope, appServerResult, verification);
+      appendAppServerReceipt(envelope, appServerResult);
       acknowledgeEnvelope(envelope);
       await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
       log(
@@ -622,11 +526,18 @@ async function drainAppServer(): Promise<void> {
 }
 
 function requestAppServerDrain(): void {
+  appServerDrainRequested = true;
   if (appServerDrain) return;
-  appServerDrain = drainAppServer().catch((error) => {
+  appServerDrain = (async () => {
+    while (appServerDrainRequested && !shuttingDown) {
+      appServerDrainRequested = false;
+      await drainAppServer();
+    }
+  })().catch((error) => {
     log(`relay-drain-failure error=${formatError(error)}`);
   }).finally(() => {
     appServerDrain = null;
+    if (appServerDrainRequested && !shuttingDown) requestAppServerDrain();
   });
 }
 
@@ -871,7 +782,7 @@ async function receiveEvent(
     source_evidence: sourceEvidence,
     live_verification: threadSnapshot.verification,
     previous_thread_message: threadSnapshot.previousThreadMessage,
-    closure_condition: "Slack monitor routes the wake and the destination task accepts it",
+    closure_condition: "The frozen destination task accepts the exact routed wake",
   };
 
   try {
@@ -1007,7 +918,7 @@ setInterval(() => {
 }, 60_000).unref();
 
 log(
-  `startup relay_thread=${SLACK_MONITOR_THREAD_ID} queue=${QUEUE_FILE} delivery=codex_app_server_then_codex_desktop_ipc_fallback`,
+  `startup fallback_relay_thread=${SLACK_MONITOR_THREAD_ID} queue=${QUEUE_FILE} delivery=codex_app_server_resume_then_codex_desktop_ipc_fallback`,
 );
 rehydratePendingEvents();
 try {

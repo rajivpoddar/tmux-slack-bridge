@@ -38,7 +38,7 @@ class FakeChild extends EventEmitter {
 }
 
 describe("Codex app-server transport", () => {
-  test("initializes, starts one ephemeral thread, starts one turn, and requires downstream acceptance", async () => {
+  test("resumes the destination task and returns immediately after turn acceptance", async () => {
     const methods: string[] = [];
     let child!: FakeChild;
     const spawnChild: AppServerSpawnChild = (() => {
@@ -46,29 +46,15 @@ describe("Codex app-server transport", () => {
         if (request.method !== "initialized") methods.push(String(request.method));
         if (request.method === "initialize") {
           current.send({ id: request.id, result: {} });
-        } else if (request.method === "thread/start") {
-          expect(request.params).toMatchObject({ ephemeral: true, cwd: "/tmp/heydonna" });
-          current.send({ id: request.id, result: { thread: { id: "thread-1" } } });
+        } else if (request.method === "thread/resume") {
+          expect(request.params).toEqual({ threadId: "destination-1" });
+          current.send({ id: request.id, result: { thread: { id: "destination-1" } } });
         } else if (request.method === "turn/start") {
+          expect(request.params).toMatchObject({
+            threadId: "destination-1",
+            input: [{ type: "text", text: "SOP path: /tmp/hey-sop.md\n\nsource" }],
+          });
           current.send({ id: request.id, result: { turn: { id: "turn-1" } } });
-          current.send({
-            method: "item/completed",
-            params: {
-              threadId: "thread-1",
-              turnId: "turn-1",
-              item: {
-                type: "agentMessage",
-                text: 'RELAY_WAKE_CONSUMED {"key":"C1:1","fingerprint":"fp-1","slack_reply_ts":"2.0","slack_suppressed":false}',
-              },
-            },
-          });
-          current.send({
-            method: "turn/completed",
-            params: {
-              threadId: "thread-1",
-              turn: { id: "turn-1", status: "completed", items: [], itemsView: "notLoaded" },
-            },
-          });
         }
       });
       return child as unknown as ChildProcessWithoutNullStreams;
@@ -76,38 +62,24 @@ describe("Codex app-server transport", () => {
 
     const client = new CodexAppServerClient({ spawnChild });
     const result = await client.deliver({
-      project: "heydonna",
-      cwd: "/tmp/heydonna",
       destinationThreadId: "destination-1",
-      consumerSopPath: "/tmp/hey-sop.md",
       routedWakeText: "SOP path: /tmp/hey-sop.md\n\nsource",
-      receiptKey: "C1:1",
-      fingerprint: "fp-1",
     });
 
-    expect(result).toMatchObject({ status: "delivered", threadId: "thread-1", turnId: "turn-1" });
-    expect(result).toMatchObject({
-      wakeReceipt: {
-        key: "C1:1",
-        fingerprint: "fp-1",
-        slack_reply_ts: "2.0",
-        slack_suppressed: false,
-      },
-    });
-    expect(methods).toEqual(["initialize", "thread/start", "turn/start"]);
+    expect(result).toEqual({ status: "delivered", threadId: "destination-1", turnId: "turn-1" });
+    expect(methods).toEqual(["initialize", "thread/resume", "turn/start"]);
     client.stop();
   });
 
-  test("does not fall back after a turn was accepted but the child dies", async () => {
+  test("fails closed when turn acceptance becomes uncertain", async () => {
     let child!: FakeChild;
     const spawnChild: AppServerSpawnChild = (() => {
       child = fakeChild((request, current) => {
         if (request.method === "initialize") current.send({ id: request.id, result: {} });
-        if (request.method === "thread/start") {
-          current.send({ id: request.id, result: { thread: { id: "thread-2" } } });
+        if (request.method === "thread/resume") {
+          current.send({ id: request.id, result: { thread: { id: "destination-2" } } });
         }
         if (request.method === "turn/start") {
-          current.send({ id: request.id, result: { turn: { id: "turn-2" } } });
           current.kill();
         }
       });
@@ -116,16 +88,35 @@ describe("Codex app-server transport", () => {
 
     const client = new CodexAppServerClient({ spawnChild });
     const result = await client.deliver({
-      project: "superproofer",
-      cwd: "/tmp/superproofer",
       destinationThreadId: "destination-2",
-      consumerSopPath: "/tmp/godavari-sop.md",
       routedWakeText: "SOP path: /tmp/godavari-sop.md\n\nsource",
-      receiptKey: "C2:2",
-      fingerprint: "fp-2",
     });
 
-    expect(result).toMatchObject({ status: "uncertain", threadId: "thread-2", turnId: "turn-2" });
+    expect(result).toMatchObject({ status: "uncertain", threadId: "destination-2" });
+    client.stop();
+  });
+
+  test("does not start a new task when the destination cannot be resumed", async () => {
+    const methods: string[] = [];
+    const spawnChild: AppServerSpawnChild = (() => {
+      const child = fakeChild((request, current) => {
+        if (request.method !== "initialized") methods.push(String(request.method));
+        if (request.method === "initialize") current.send({ id: request.id, result: {} });
+        if (request.method === "thread/resume") {
+          current.send({ id: request.id, error: { code: -32000, message: "thread-not-found" } });
+        }
+      });
+      return child as unknown as ChildProcessWithoutNullStreams;
+    }) as unknown as AppServerSpawnChild;
+
+    const client = new CodexAppServerClient({ spawnChild });
+    const result = await client.deliver({
+      destinationThreadId: "missing-destination",
+      routedWakeText: "exact wake",
+    });
+
+    expect(result).toMatchObject({ status: "unavailable", detail: "app-server-thread-not-found" });
+    expect(methods).toEqual(["initialize", "thread/resume"]);
     client.stop();
   });
 });
