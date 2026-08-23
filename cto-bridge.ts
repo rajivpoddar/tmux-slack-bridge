@@ -8,7 +8,7 @@
  */
 import { App } from "@slack/bolt";
 import type { SocketModeReceiver } from "@slack/bolt";
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -39,7 +39,7 @@ const MONITOR_TRIGGER_RECEIPTS_FILE = "/tmp/cto-ipc-monitor-trigger-receipts.jso
 const APP_SERVER_DELIVERY_RECEIPTS_FILE = "/tmp/cto-app-server-delivery-receipts.jsonl";
 const IPC_SENDER = "/Users/rajiv/.codex/skills/codex-ipc-send-message/scripts/send_message.py";
 const RELAY_SNAPSHOT_HELPER = "/Users/rajiv/.claude/scripts/cto-relay-snapshot.py";
-const RELAY_SNAPSHOT_FILE = "/tmp/cto-slack-relay-snapshot.json";
+const RELAY_SNAPSHOT_FILE_PREFIX = "/tmp/cto-slack-relay-snapshot.bridge";
 const RELAY_CLAIMS_FILE = "/tmp/cto-slack-relay-claims.json";
 const RELAY_LOCK_FILE = "/tmp/cto-slack-relay.lock";
 const RELAY_HEARTBEAT_FILE = "/tmp/cto-slack-relay-heartbeat";
@@ -303,29 +303,40 @@ function asRoutedEnvelope(value: unknown, claimOwner: string): RoutedEnvelope | 
 
 async function runRelaySnapshot(): Promise<RoutedEnvelope | null> {
   const claimOwner = `bridge-${process.pid}-${randomUUID()}`;
-  const result = await runPython([
-    RELAY_SNAPSHOT_HELPER,
-    "--limit",
-    "1",
-    "--route-sop",
-    SLACK_MONITOR_SOP,
-    "--claim-ttl-seconds",
-    String(CLAIM_TTL_SECONDS),
-    "--claim-owner",
-    claimOwner,
-  ]);
-  if (result.code !== 0) {
-    log(`relay-snapshot-failure error=${result.stderr.trim() || `exit-${result.code}`}`);
-    return null;
+  const snapshotFile = `${RELAY_SNAPSHOT_FILE_PREFIX}-${process.pid}-${randomUUID()}.json`;
+  try {
+    const result = await runPython([
+      RELAY_SNAPSHOT_HELPER,
+      "--limit",
+      "1",
+      "--route-sop",
+      SLACK_MONITOR_SOP,
+      "--output",
+      snapshotFile,
+      "--claim-ttl-seconds",
+      String(CLAIM_TTL_SECONDS),
+      "--claim-owner",
+      claimOwner,
+    ]);
+    if (result.code !== 0) {
+      log(`relay-snapshot-failure error=${result.stderr.trim() || `exit-${result.code}`}`);
+      return null;
+    }
+    const snapshot = readJsonFile(snapshotFile, []) as unknown;
+    if (!Array.isArray(snapshot) || snapshot.length === 0) return null;
+    const envelope = asRoutedEnvelope(snapshot[0], claimOwner);
+    if (!envelope) {
+      log("relay-snapshot-invalid missing-exact-routed-fields");
+      return null;
+    }
+    return envelope;
+  } finally {
+    try {
+      unlinkSync(snapshotFile);
+    } catch {
+      // The helper may fail before creating its invocation-private output.
+    }
   }
-  const snapshot = readJsonFile(RELAY_SNAPSHOT_FILE, []) as unknown;
-  if (!Array.isArray(snapshot) || snapshot.length === 0) return null;
-  const envelope = asRoutedEnvelope(snapshot[0], claimOwner);
-  if (!envelope) {
-    log("relay-snapshot-invalid missing-exact-routed-fields");
-    return null;
-  }
-  return envelope;
 }
 
 async function updateClaim(

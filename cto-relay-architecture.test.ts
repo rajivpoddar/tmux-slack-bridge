@@ -58,6 +58,9 @@ describe("CTO Slack relay architecture", () => {
     expect(BRIDGE_SOURCE).not.toContain("no-client-found");
     expect(BRIDGE_SOURCE).toContain("pending.sort(compareSourceOrder)");
     expect(BRIDGE_SOURCE).toContain("appServerDrainRequested = true");
+    expect(BRIDGE_SOURCE).toContain('"--output",\n      snapshotFile');
+    expect(BRIDGE_SOURCE).toContain("unlinkSync(snapshotFile)");
+    expect(BRIDGE_SOURCE).not.toContain('readJsonFile("/tmp/cto-slack-relay-snapshot.json"');
     expect(BRIDGE_SOURCE).not.toContain("verifyConsumerTerminal");
   });
 
