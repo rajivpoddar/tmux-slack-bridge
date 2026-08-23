@@ -2,9 +2,9 @@
  * Durable Slack Socket Mode ingress for the CTO Slack monitor task.
  *
  * This persistent LaunchAgent receives, durably queues, minimally verifies,
- * and delivers the frozen routed wake to its existing destination task through
- * Codex app-server. The Slack-monitor task and its minute heartbeat remain the
- * definite-not-sent fallback; they are not the normal delivery path.
+ * and queues the frozen routed wake to its existing destination task through
+ * Codex's supported thread queue. The Slack-monitor task and its minute
+ * heartbeat remain the definite-not-sent fallback.
  */
 import { App } from "@slack/bolt";
 import type { SocketModeReceiver } from "@slack/bolt";
@@ -389,7 +389,7 @@ function appendAppServerReceipt(
   appendReceipt(APP_SERVER_DELIVERY_RECEIPTS_FILE, {
     receipt_key: envelope.dedup_key,
     fingerprint: envelope.fingerprint,
-    transport: "codex_app_server",
+    transport: "codex_thread_queue",
     project: envelope.relay_route.project,
     destination_thread_id: envelope.relay_route.destination_thread_id,
     ...result,
@@ -473,20 +473,21 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
     const appServerResult = await appServerClient.deliver({
       destinationThreadId: envelope.relay_route.destination_thread_id,
       routedWakeText: envelope.routed_wake_text,
+      dedupKey: envelope.dedup_key,
     });
     if (appServerResult.status === "delivered") {
       appendAppServerReceipt(envelope, appServerResult);
       acknowledgeEnvelope(envelope);
       await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
       log(
-        `relay-delivered key=${envelope.dedup_key} transport=codex_app_server project=${envelope.relay_route.project} thread=${appServerResult.threadId} turn=${appServerResult.turnId}`,
+        `relay-delivered key=${envelope.dedup_key} transport=codex_thread_queue project=${envelope.relay_route.project} thread=${appServerResult.threadId} submission=${appServerResult.queuedSubmissionId}`,
       );
       process.stdout.write(
         `RELAY_DELIVERED ${JSON.stringify({
           key: envelope.dedup_key,
-          transport: "codex_app_server",
+          transport: "codex_thread_queue",
           thread_id: appServerResult.threadId,
-          turn_id: appServerResult.turnId,
+          queued_submission_id: appServerResult.queuedSubmissionId,
         })}\n`,
       );
       return "delivered";
@@ -500,9 +501,9 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
       return "uncertain";
     }
 
-    // Before a turn is accepted, return the lease and use the existing
-    // Desktop trigger. Once a turn is accepted, uncertainty stays leased to
-    // prevent a second relay from duplicating a possibly-running task.
+    // Before a queue submission is accepted, return the lease and use the
+    // existing Desktop trigger. Once queue acceptance is uncertain, keep the
+    // lease to prevent a second relay from duplicating a possibly-running task.
     await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
     const fallback = await triggerSlackMonitor(envelope);
     if (fallback.status === "delivered") {
@@ -929,7 +930,7 @@ setInterval(() => {
 }, 60_000).unref();
 
 log(
-  `startup fallback_relay_thread=${SLACK_MONITOR_THREAD_ID} queue=${QUEUE_FILE} delivery=codex_app_server_resume_then_codex_desktop_ipc_fallback`,
+  `startup fallback_relay_thread=${SLACK_MONITOR_THREAD_ID} queue=${QUEUE_FILE} delivery=codex_thread_queue_then_codex_desktop_ipc_fallback`,
 );
 rehydratePendingEvents();
 try {

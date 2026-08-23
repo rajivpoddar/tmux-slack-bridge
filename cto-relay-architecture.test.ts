@@ -42,12 +42,15 @@ describe("CTO Slack relay architecture", () => {
     expect(BRIDGE_SOURCE).toContain("MONITOR_TRIGGER_RECEIPTS_FILE");
   });
 
-  test("uses app-server only to resume the destination and accept one exact turn", () => {
+  test("uses the supported app-server queue without creating or resuming a task", () => {
     expect(BRIDGE_SOURCE).toContain("CodexAppServerClient");
-    expect(APP_SERVER_SOURCE).toContain('this.request("thread/resume"');
-    expect(APP_SERVER_SOURCE).toContain('this.request("turn/start"');
+    expect(APP_SERVER_SOURCE).toContain('this.request("thread/queue/add"');
+    expect(APP_SERVER_SOURCE).not.toContain('this.request("thread/resume"');
+    expect(APP_SERVER_SOURCE).not.toContain('this.request("turn/start"');
     expect(APP_SERVER_SOURCE).not.toContain('this.request("thread/start"');
     expect(APP_SERVER_SOURCE).not.toContain("ephemeral: true");
+    expect(APP_SERVER_SOURCE).toContain("stableClientUserMessageId");
+    expect(APP_SERVER_SOURCE).toContain("/Applications/ChatGPT.app/Contents/Resources/codex");
     expect(APP_SERVER_SOURCE).not.toContain("waitForCompletion");
     expect(APP_SERVER_SOURCE).not.toContain("turn/completed");
     expect(BRIDGE_SOURCE).toContain('updateClaim("renew"');

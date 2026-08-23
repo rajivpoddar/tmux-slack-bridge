@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 
-const DEFAULT_COMMAND = "codex";
+const DEFAULT_COMMAND = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const DEFAULT_ARGS = ["app-server", "--stdio"];
 const START_ATTEMPTS = 2;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -11,20 +12,22 @@ const REQUEST_TIMEOUT_MS = 20_000;
 export type AppServerDeliveryRequest = {
   destinationThreadId: string;
   routedWakeText: string;
+  dedupKey: string;
 };
 
 export type AppServerDeliveryResult =
   | {
       status: "delivered";
       threadId: string;
-      turnId: string;
+      queuedSubmissionId: string;
+      clientUserMessageId: string;
     }
   | { status: "unavailable"; detail: string }
   | {
       status: "uncertain";
       detail: string;
       threadId: string;
-      turnId?: string;
+      clientUserMessageId: string;
     };
 
 type JsonRpcMessage = {
@@ -36,6 +39,8 @@ type JsonRpcMessage = {
 };
 
 type AppServerChild = ChildProcessWithoutNullStreams;
+class AppServerRpcError extends Error {}
+
 export type AppServerSpawnChild = (
   command: string,
   args: string[],
@@ -67,32 +72,31 @@ export class CodexAppServerClient {
   }
 
   async deliver(request: AppServerDeliveryRequest): Promise<AppServerDeliveryResult> {
-    let threadId = "";
-    let turnId = "";
-    let turnStartAttempted = false;
+    const threadId = request.destinationThreadId;
+    const clientUserMessageId = stableClientUserMessageId(request.dedupKey);
+    let queueAddAttempted = false;
     try {
       await this.ensureStarted();
-      const threadResponse = await this.request("thread/resume", {
-        threadId: request.destinationThreadId,
-      });
-      threadId = readNestedId(threadResponse.result, "thread");
-      if (!threadId) throw new Error("thread-resume-response-missing-thread-id");
-      if (threadId !== request.destinationThreadId) {
-        throw new Error("thread-resume-response-mismatched-thread-id");
-      }
-
-      turnStartAttempted = true;
-      const turnResponse = await this.request("turn/start", {
+      queueAddAttempted = true;
+      const queueResponse = await this.request("thread/queue/add", {
         threadId,
-        approvalPolicy: "never",
-        input: [{ type: "text", text: request.routedWakeText }],
+        input: [{ type: "text", text: request.routedWakeText, text_elements: [] }],
+        clientUserMessageId,
       });
-      turnId = readNestedId(turnResponse.result, "turn");
-      if (!turnId) throw new Error("turn-start-response-missing-turn-id");
-      return { status: "delivered", threadId, turnId };
+      const queuedSubmission = readNestedRecord(queueResponse.result, "queuedSubmission");
+      const queuedSubmissionId = readString(queuedSubmission, "id");
+      const returnedClientUserMessageId = readString(queuedSubmission, "clientUserMessageId");
+      if (!queuedSubmissionId) throw new Error("thread-queue-add-response-missing-submission-id");
+      if (returnedClientUserMessageId !== clientUserMessageId) {
+        throw new Error("thread-queue-add-response-mismatched-client-message-id");
+      }
+      return { status: "delivered", threadId, queuedSubmissionId, clientUserMessageId };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      if (turnStartAttempted) return { status: "uncertain", threadId, detail };
+      if (error instanceof AppServerRpcError) return { status: "unavailable", detail };
+      if (queueAddAttempted) {
+        return { status: "uncertain", threadId, clientUserMessageId, detail };
+      }
       return { status: "unavailable", detail };
     }
   }
@@ -140,7 +144,7 @@ export class CodexAppServerClient {
     });
     await this.request("initialize", {
       clientInfo: { name: "cto-bridge", version: "1.0.0" },
-      capabilities: {},
+      capabilities: { experimentalApi: true, requestAttestation: false },
     });
     this.write({ jsonrpc: "2.0", method: "initialized", params: {} });
     this.initialized = true;
@@ -183,7 +187,7 @@ export class CodexAppServerClient {
       this.pendingRequests.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) {
-        pending.reject(new Error(`app-server-${message.error.message ?? "request-failed"}`));
+        pending.reject(new AppServerRpcError(`app-server-${message.error.message ?? "request-failed"}`));
       } else {
         pending.resolve(message);
       }
@@ -203,9 +207,23 @@ export class CodexAppServerClient {
   }
 }
 
-function readNestedId(result: Record<string, unknown> | undefined, field: string): string {
+function readNestedRecord(
+  result: Record<string, unknown> | undefined,
+  field: string,
+): Record<string, unknown> {
   const value = result?.[field];
-  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
-  const id = (value as Record<string, unknown>).id;
-  return typeof id === "string" ? id : "";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function readString(value: Record<string, unknown>, field: string): string {
+  return typeof value[field] === "string" ? value[field] : "";
+}
+
+export function stableClientUserMessageId(dedupKey: string): string {
+  const bytes = createHash("sha256").update(`cto-slack-bridge:${dedupKey}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

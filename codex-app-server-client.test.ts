@@ -6,6 +6,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import {
   CodexAppServerClient,
+  stableClientUserMessageId,
   type AppServerSpawnChild,
 } from "./codex-app-server-client.ts";
 
@@ -38,7 +39,7 @@ class FakeChild extends EventEmitter {
 }
 
 describe("Codex app-server transport", () => {
-  test("resumes the destination task and returns immediately after turn acceptance", async () => {
+  test("queues the destination task and returns immediately after queue acceptance", async () => {
     const methods: string[] = [];
     let child!: FakeChild;
     const spawnChild: AppServerSpawnChild = (() => {
@@ -46,15 +47,23 @@ describe("Codex app-server transport", () => {
         if (request.method !== "initialized") methods.push(String(request.method));
         if (request.method === "initialize") {
           current.send({ id: request.id, result: {} });
-        } else if (request.method === "thread/resume") {
-          expect(request.params).toEqual({ threadId: "destination-1" });
-          current.send({ id: request.id, result: { thread: { id: "destination-1" } } });
-        } else if (request.method === "turn/start") {
+        } else if (request.method === "thread/queue/add") {
+          const clientUserMessageId = stableClientUserMessageId("C1:1");
           expect(request.params).toMatchObject({
             threadId: "destination-1",
-            input: [{ type: "text", text: "SOP path: /tmp/hey-sop.md\n\nsource" }],
+            input: [{ type: "text", text: "SOP path: /tmp/hey-sop.md\n\nsource", text_elements: [] }],
+            clientUserMessageId,
           });
-          current.send({ id: request.id, result: { turn: { id: "turn-1" } } });
+          current.send({
+            id: request.id,
+            result: {
+              queuedSubmission: {
+                id: "submission-1",
+                input: [],
+                clientUserMessageId,
+              },
+            },
+          });
         }
       });
       return child as unknown as ChildProcessWithoutNullStreams;
@@ -64,10 +73,16 @@ describe("Codex app-server transport", () => {
     const result = await client.deliver({
       destinationThreadId: "destination-1",
       routedWakeText: "SOP path: /tmp/hey-sop.md\n\nsource",
+      dedupKey: "C1:1",
     });
 
-    expect(result).toEqual({ status: "delivered", threadId: "destination-1", turnId: "turn-1" });
-    expect(methods).toEqual(["initialize", "thread/resume", "turn/start"]);
+    expect(result).toEqual({
+      status: "delivered",
+      threadId: "destination-1",
+      queuedSubmissionId: "submission-1",
+      clientUserMessageId: stableClientUserMessageId("C1:1"),
+    });
+    expect(methods).toEqual(["initialize", "thread/queue/add"]);
     client.stop();
   });
 
@@ -76,10 +91,7 @@ describe("Codex app-server transport", () => {
     const spawnChild: AppServerSpawnChild = (() => {
       child = fakeChild((request, current) => {
         if (request.method === "initialize") current.send({ id: request.id, result: {} });
-        if (request.method === "thread/resume") {
-          current.send({ id: request.id, result: { thread: { id: "destination-2" } } });
-        }
-        if (request.method === "turn/start") {
+        if (request.method === "thread/queue/add") {
           current.kill();
         }
       });
@@ -90,19 +102,20 @@ describe("Codex app-server transport", () => {
     const result = await client.deliver({
       destinationThreadId: "destination-2",
       routedWakeText: "SOP path: /tmp/godavari-sop.md\n\nsource",
+      dedupKey: "C2:2",
     });
 
     expect(result).toMatchObject({ status: "uncertain", threadId: "destination-2" });
     client.stop();
   });
 
-  test("does not start a new task when the destination cannot be resumed", async () => {
+  test("fails definitely without creating a task when the destination is missing", async () => {
     const methods: string[] = [];
     const spawnChild: AppServerSpawnChild = (() => {
       const child = fakeChild((request, current) => {
         if (request.method !== "initialized") methods.push(String(request.method));
         if (request.method === "initialize") current.send({ id: request.id, result: {} });
-        if (request.method === "thread/resume") {
+        if (request.method === "thread/queue/add") {
           current.send({ id: request.id, error: { code: -32000, message: "thread-not-found" } });
         }
       });
@@ -113,10 +126,21 @@ describe("Codex app-server transport", () => {
     const result = await client.deliver({
       destinationThreadId: "missing-destination",
       routedWakeText: "exact wake",
+      dedupKey: "missing:1",
     });
 
     expect(result).toMatchObject({ status: "unavailable", detail: "app-server-thread-not-found" });
-    expect(methods).toEqual(["initialize", "thread/resume"]);
+    expect(methods).toEqual(["initialize", "thread/queue/add"]);
     client.stop();
+  });
+
+  test("derives a stable UUID-shaped idempotency key without exposing message text", () => {
+    expect(stableClientUserMessageId("D1:123.456")).toBe(
+      stableClientUserMessageId("D1:123.456"),
+    );
+    expect(stableClientUserMessageId("D1:123.456")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(stableClientUserMessageId("D1:123.456")).not.toContain("123.456");
   });
 });
