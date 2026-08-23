@@ -47,6 +47,8 @@ describe("CTO Slack relay architecture", () => {
     expect(APP_SERVER_SOURCE).toContain('this.request("thread/start"');
     expect(APP_SERVER_SOURCE).toContain("ephemeral: true");
     expect(APP_SERVER_SOURCE).toContain('this.request("turn/start"');
+    expect(APP_SERVER_SOURCE).toContain('this.request("thread/read"');
+    expect(APP_SERVER_SOURCE).toContain("includeTurns: true");
     expect(APP_SERVER_SOURCE).toContain("ephemeral receiving CTO task");
     expect(APP_SERVER_SOURCE).toContain("Do not call codex_app__send_message_to_thread");
     expect(APP_SERVER_SOURCE).toContain("RELAY_WAKE_CONSUMED");

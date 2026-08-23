@@ -130,13 +130,15 @@ export class CodexAppServerClient {
 
       const terminal = await completion;
       const status = terminal.status;
-      const wakeReceipt = readWakeTerminalReceipt(terminal);
+      const threadRead = await this.request("thread/read", { threadId, includeTurns: true });
+      const hydratedTerminal = readTurn(threadRead.result, turnId) ?? terminal;
+      const wakeReceipt = readWakeTerminalReceipt(hydratedTerminal);
       if (
         status === "completed" &&
         wakeReceipt?.key === request.receiptKey &&
         wakeReceipt.fingerprint === request.fingerprint
       ) {
-        return { status: "delivered", threadId, turnId, terminal, wakeReceipt };
+        return { status: "delivered", threadId, turnId, terminal: hydratedTerminal, wakeReceipt };
       }
       if (status === "failed" || status === "interrupted") {
         return { status: "uncertain", threadId, turnId, detail: `turn-${String(status)}` };
@@ -145,7 +147,7 @@ export class CodexAppServerClient {
         status: "uncertain",
         threadId,
         turnId,
-        terminal,
+        terminal: hydratedTerminal,
         detail: "terminal-delivery-marker-missing",
       };
     } catch (error) {
@@ -292,6 +294,26 @@ function readNestedId(result: Record<string, unknown> | undefined, field: string
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const id = (value as Record<string, unknown>).id;
   return typeof id === "string" ? id : "";
+}
+
+function readTurn(
+  result: Record<string, unknown> | undefined,
+  turnId: string,
+): Record<string, unknown> | null {
+  const thread = result?.thread;
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)) return null;
+  const turns = (thread as Record<string, unknown>).turns;
+  if (!Array.isArray(turns)) return null;
+  const turn = turns.find(
+    (value) =>
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).id === turnId,
+  );
+  return turn && typeof turn === "object" && !Array.isArray(turn)
+    ? (turn as Record<string, unknown>)
+    : null;
 }
 
 function readWakeTerminalReceipt(terminal: Record<string, unknown>): WakeTerminalReceipt | null {
