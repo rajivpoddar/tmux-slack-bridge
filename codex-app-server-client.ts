@@ -75,6 +75,7 @@ export class CodexAppServerClient {
     string,
     { resolve: (turn: Record<string, unknown>) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
   >();
+  private readonly completedItems = new Map<string, Array<Record<string, unknown>>>();
 
   constructor(options: {
     command?: string;
@@ -130,15 +131,13 @@ export class CodexAppServerClient {
 
       const terminal = await completion;
       const status = terminal.status;
-      const threadRead = await this.request("thread/read", { threadId, includeTurns: true });
-      const hydratedTerminal = readTurn(threadRead.result, turnId) ?? terminal;
-      const wakeReceipt = readWakeTerminalReceipt(hydratedTerminal);
+      const wakeReceipt = readWakeTerminalReceipt(terminal);
       if (
         status === "completed" &&
         wakeReceipt?.key === request.receiptKey &&
         wakeReceipt.fingerprint === request.fingerprint
       ) {
-        return { status: "delivered", threadId, turnId, terminal: hydratedTerminal, wakeReceipt };
+        return { status: "delivered", threadId, turnId, terminal, wakeReceipt };
       }
       if (status === "failed" || status === "interrupted") {
         return { status: "uncertain", threadId, turnId, detail: `turn-${String(status)}` };
@@ -147,7 +146,7 @@ export class CodexAppServerClient {
         status: "uncertain",
         threadId,
         turnId,
-        terminal: hydratedTerminal,
+        terminal,
         detail: "terminal-delivery-marker-missing",
       };
     } catch (error) {
@@ -261,15 +260,34 @@ export class CodexAppServerClient {
       }
       return;
     }
+    if (message.method === "item/completed") {
+      const threadId = String(message.params?.threadId ?? "");
+      const turnId = String(message.params?.turnId ?? "");
+      const item = message.params?.item;
+      if (!threadId || !turnId || !item || typeof item !== "object" || Array.isArray(item)) return;
+      const key = `${threadId}:${turnId}`;
+      const items = this.completedItems.get(key) ?? [];
+      items.push(item as Record<string, unknown>);
+      this.completedItems.set(key, items);
+      return;
+    }
     if (message.method !== "turn/completed") return;
     const threadId = String(message.params?.threadId ?? "");
     const turn = message.params?.turn;
     if (!threadId || !turn || typeof turn !== "object" || Array.isArray(turn)) return;
+    const turnRecord = turn as Record<string, unknown>;
+    const turnId = String(turnRecord.id ?? "");
+    const key = `${threadId}:${turnId}`;
+    const completedItems = this.completedItems.get(key) ?? [];
+    this.completedItems.delete(key);
+    const terminal = completedItems.length > 0
+      ? { ...turnRecord, items: completedItems, itemsView: "full" }
+      : turnRecord;
     const waiter = this.completionWaiters.get(threadId);
     if (!waiter) return;
     this.completionWaiters.delete(threadId);
     clearTimeout(waiter.timer);
-    waiter.resolve(turn as Record<string, unknown>);
+    waiter.resolve(terminal);
   }
 
   private failTransport(error: unknown): void {
@@ -284,6 +302,7 @@ export class CodexAppServerClient {
       waiter.reject(normalized);
       this.completionWaiters.delete(threadId);
     }
+    this.completedItems.clear();
     this.initialized = false;
     if (this.child?.killed || this.child?.exitCode !== null) this.child = null;
   }
@@ -294,26 +313,6 @@ function readNestedId(result: Record<string, unknown> | undefined, field: string
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const id = (value as Record<string, unknown>).id;
   return typeof id === "string" ? id : "";
-}
-
-function readTurn(
-  result: Record<string, unknown> | undefined,
-  turnId: string,
-): Record<string, unknown> | null {
-  const thread = result?.thread;
-  if (!thread || typeof thread !== "object" || Array.isArray(thread)) return null;
-  const turns = (thread as Record<string, unknown>).turns;
-  if (!Array.isArray(turns)) return null;
-  const turn = turns.find(
-    (value) =>
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      (value as Record<string, unknown>).id === turnId,
-  );
-  return turn && typeof turn === "object" && !Array.isArray(turn)
-    ? (turn as Record<string, unknown>)
-    : null;
 }
 
 function readWakeTerminalReceipt(terminal: Record<string, unknown>): WakeTerminalReceipt | null {

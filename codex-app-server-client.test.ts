@@ -52,27 +52,21 @@ describe("Codex app-server transport", () => {
         } else if (request.method === "turn/start") {
           current.send({ id: request.id, result: { turn: { id: "turn-1" } } });
           current.send({
+            method: "item/completed",
+            params: {
+              threadId: "thread-1",
+              turnId: "turn-1",
+              item: {
+                type: "agentMessage",
+                text: 'RELAY_WAKE_CONSUMED {"key":"C1:1","fingerprint":"fp-1","slack_reply_ts":"2.0","slack_suppressed":false}',
+              },
+            },
+          });
+          current.send({
             method: "turn/completed",
             params: {
               threadId: "thread-1",
               turn: { id: "turn-1", status: "completed", items: [], itemsView: "notLoaded" },
-            },
-          });
-        } else if (request.method === "thread/read") {
-          expect(request.params).toEqual({ threadId: "thread-1", includeTurns: true });
-          current.send({
-            id: request.id,
-            result: {
-              thread: {
-                turns: [{
-                  id: "turn-1",
-                  status: "completed",
-                  items: [{
-                    type: "agentMessage",
-                    text: 'RELAY_WAKE_CONSUMED {"key":"C1:1","fingerprint":"fp-1","slack_reply_ts":"2.0","slack_suppressed":false}',
-                  }],
-                }],
-              },
             },
           });
         }
@@ -100,7 +94,7 @@ describe("Codex app-server transport", () => {
         slack_suppressed: false,
       },
     });
-    expect(methods).toEqual(["initialize", "thread/start", "turn/start", "thread/read"]);
+    expect(methods).toEqual(["initialize", "thread/start", "turn/start"]);
     client.stop();
   });
 
