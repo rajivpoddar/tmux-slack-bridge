@@ -36,7 +36,13 @@ export type AppServerDeliveryResult =
     }
   | { status: "pending"; detail: string }
   | { status: "unavailable"; detail: string }
-  | { status: "uncertain"; detail: string; threadId: string; turnId?: string };
+  | {
+      status: "uncertain";
+      detail: string;
+      threadId: string;
+      turnId?: string;
+      terminal?: Record<string, unknown>;
+    };
 
 type JsonRpcMessage = {
   id?: number;
@@ -135,7 +141,13 @@ export class CodexAppServerClient {
       if (status === "failed" || status === "interrupted") {
         return { status: "uncertain", threadId, turnId, detail: `turn-${String(status)}` };
       }
-      return { status: "uncertain", threadId, turnId, detail: "terminal-delivery-marker-missing" };
+      return {
+        status: "uncertain",
+        threadId,
+        turnId,
+        terminal,
+        detail: "terminal-delivery-marker-missing",
+      };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (turnAccepted) return { status: "uncertain", threadId, turnId, detail };
