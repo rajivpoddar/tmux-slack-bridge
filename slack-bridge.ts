@@ -457,19 +457,23 @@ async function downloadImages(
 /**
  * Send text to the target tmux pane via send-keys.
  * Uses -l (literal) to prevent tmux from interpreting special characters.
- * PM-pane delivery is busy-aware: confirmed idle -> Enter, busy or unknown ->
- * C-q (OMP follow-up). Dev-slot delivery remains Enter/steering.
+ * Native-Claude PM delivery always submits immediately with Enter after a
+ * short paste/render dwell. OMP keeps its busy-aware C-q follow-up behavior
+ * behind MOP_PM_RUNTIME=omp. Dev-slot delivery remains Enter/steering.
  */
 export async function sendToPane(text: string, target?: string) {
   const pane = target || TMUX_TARGET;
   const escaped = shellEscape(text);
-  const pmBusy = pane === "0:0.0" ? await pmBusyState() : null;
-  const submitKey = resolveSubmitKey(pane, pmBusy);
+  const runtime = resolvePMRuntime(process.env.MOP_PM_RUNTIME);
+  const pmBusy = pane === "0:0.0" && runtime === "omp" ? await pmBusyState() : null;
+  const submitKey = resolveSubmitKey(pane, pmBusy, runtime);
   execSync(
-    `tmux send-keys -t ${pane} -l ${escaped} && sleep 1 && tmux send-keys -t ${pane} ${submitKey}`,
+    `tmux send-keys -t ${pane} -l ${escaped} && sleep 0.5 && tmux send-keys -t ${pane} ${submitKey}`,
     { timeout: 5000 }
   );
-  log(`✅ sendToPane ${pane} submit=${submitKey} pm_busy=${pmBusy === null ? "unknown" : pmBusy}`);
+  log(
+    `✅ sendToPane ${pane} runtime=${runtime} submit=${submitKey} pm_busy=${pmBusy === null ? "unknown" : pmBusy}`
+  );
 }
 
 // PR-merge auto-cleanup REMOVED 2026-05-11 18:50 IST per Rajiv directive
@@ -596,15 +600,24 @@ export async function pmBusyState(): Promise<boolean | null> {
 /**
  * Choose the terminal submit key for a tmux pane delivery.
  *
- * Dev-slot panes keep Enter/steering exactly unchanged. PM-pane (0:0.0)
- * delivery uses C-q (OMP follow-up queue) when PM is busy OR the busy signal
- * is unknown, so automated messages queue rather than steer/interleave; Enter
- * is used only when PM is confirmed idle.
+ * Dev-slot panes keep Enter/steering exactly unchanged. Native Claude always
+ * uses Enter so its own prompt queue receives a submitted turn immediately.
+ * OMP uses C-q for busy/unknown only when explicitly selected.
  */
-export function resolveSubmitKey(pane: string, pmBusy: boolean | null): "Enter" | "C-q" {
+export type PMRuntime = "claude" | "omp";
+
+export function resolvePMRuntime(value: string | undefined): PMRuntime {
+  return value === "omp" ? "omp" : "claude";
+}
+
+export function resolveSubmitKey(
+  pane: string,
+  pmBusy: boolean | null,
+  runtime: PMRuntime = "claude"
+): "Enter" | "C-q" {
   if (pane !== "0:0.0") return "Enter";
-  if (pmBusy !== false) return "C-q";
-  return "Enter";
+  if (runtime === "claude") return "Enter";
+  return pmBusy === false ? "Enter" : "C-q";
 }
 
 /**

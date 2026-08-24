@@ -67,6 +67,8 @@ let latestRecordedTs: typeof import("./slack-bridge.ts").latestRecordedTs;
 let appendReplyContextQueue: typeof import("./slack-bridge.ts").appendReplyContextQueue;
 let removeReplyContextQueue: typeof import("./slack-bridge.ts").removeReplyContextQueue;
 let pollSlackHistory: typeof import("./slack-bridge.ts").pollSlackHistory;
+let resolvePMRuntime: typeof import("./slack-bridge.ts").resolvePMRuntime;
+let resolveSubmitKey: typeof import("./slack-bridge.ts").resolveSubmitKey;
 
 describe("crash-recovery watermark guard (#4984)", () => {
   beforeAll(async () => {
@@ -82,8 +84,28 @@ describe("crash-recovery watermark guard (#4984)", () => {
     appendReplyContextQueue = bridge.appendReplyContextQueue;
     removeReplyContextQueue = bridge.removeReplyContextQueue;
     pollSlackHistory = bridge.pollSlackHistory;
+    resolvePMRuntime = bridge.resolvePMRuntime;
+    resolveSubmitKey = bridge.resolveSubmitKey;
 
     getDb();
+  });
+
+  test("native Claude submits with Enter while OMP keeps busy-aware C-q", () => {
+    expect(resolvePMRuntime(undefined)).toBe("claude");
+    expect(resolvePMRuntime("unexpected")).toBe("claude");
+    expect(resolvePMRuntime("omp")).toBe("omp");
+    expect(resolveSubmitKey("0:0.0", true, "claude")).toBe("Enter");
+    expect(resolveSubmitKey("0:0.0", null, "claude")).toBe("Enter");
+    expect(resolveSubmitKey("0:0.0", true, "omp")).toBe("C-q");
+    expect(resolveSubmitKey("0:0.0", null, "omp")).toBe("C-q");
+    expect(resolveSubmitKey("0:0.0", false, "omp")).toBe("Enter");
+    expect(resolveSubmitKey("0:0.2", true, "omp")).toBe("Enter");
+  });
+
+  test("tmux delivery waits 500ms between paste and submit", () => {
+    const source = readFileSync(new URL("./slack-bridge.ts", import.meta.url), "utf8");
+    expect(source).toMatch(/sleep 0\.5 && tmux send-keys/);
+    expect(source).not.toMatch(/sleep 1 && tmux send-keys/);
   });
 
   afterAll(() => {
