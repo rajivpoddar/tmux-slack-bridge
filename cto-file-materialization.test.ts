@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -132,5 +132,55 @@ describe("Slack image materialization through durable wake serialization", () =>
     const result = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:4.5", { rootDir: root, client, token: "xoxb-test", fetchImpl: redirectingFetch });
     expect(result[0].status).toBe("unavailable");
     expect(result[0].reason).toBe("unsafe-url");
+  });
+
+  test("streams and cancels at the byte cap, and bounds metadata plus download together", async () => {
+    const { root, client } = fixture({ one: PNG });
+    let cancelled = false;
+    const largeFetch = async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(1024 * 100));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "image/png" } });
+    };
+    const oversized = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:5.6", { rootDir: root, client, token: "xoxb-test", fetchImpl: largeFetch, maxBytes: 32 });
+    expect(oversized[0]).toMatchObject({ status: "unavailable", path: null, reason: "oversize" });
+    expect(cancelled).toBe(true);
+
+    const neverResolves = { files: { info: async () => new Promise<never>(() => {}) } };
+    const started = Date.now();
+    const timedOut = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:5.7", { rootDir: root, client: neverResolves, token: "xoxb-test", fetchImpl: largeFetch, timeoutMs: 5 });
+    expect(timedOut[0]).toMatchObject({ status: "unavailable", path: null, reason: "attachment-timeout" });
+    expect(Date.now() - started).toBeLessThan(250);
+    const timeoutWake = buildCtoDurableEnvelope({
+      key: "D1:5.7",
+      tuple: { channel: "D1", ts: "5.7", thread_ts: null, user: "U1", bot_id: null, subtype: "file_share", text: "keep timeout text" },
+      sourceEvidence: { subtype: "file_share" },
+      verification: { attempted: true, ok: true },
+      previousThreadMessage: null,
+      attachments: timedOut,
+      sopPath: "/tmp/WAKE_SOP.md",
+    });
+    expect(timeoutWake.wake_text).toContain("keep timeout text");
+  });
+
+  test("refuses reused bytes or unsafe file mode instead of reporting saved", async () => {
+    const { root, client } = fixture({ one: PNG });
+    const first = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:6.8", { rootDir: root, client, token: "xoxb-test", fetchImpl: async (url, init) => new Response(PNG, { status: 200, headers: { "content-type": "image/png" } }) });
+    expect(first[0].status).toBe("saved");
+    const path = first[0].path!;
+    chmodSync(path, 0o644);
+    const wrongMode = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:6.8", { rootDir: root, client, token: "xoxb-test", fetchImpl: async () => new Response(PNG, { status: 200, headers: { "content-type": "image/png" } }) });
+    expect(wrongMode[0]).toMatchObject({ status: "unavailable", path: null, reason: "path-collision" });
+    chmodSync(path, 0o600);
+    const different = Uint8Array.from(PNG);
+    different[different.length - 1] = 2;
+    const wrongBytes = await materializeSlackImages([{ id: "one", name: "one.png", mimetype: "image/png" }], "D1:6.8", { rootDir: root, client, token: "xoxb-test", fetchImpl: async () => new Response(different, { status: 200, headers: { "content-type": "image/png" } }) });
+    expect(wrongBytes[0]).toMatchObject({ status: "unavailable", path: null, reason: "path-collision" });
   });
 });

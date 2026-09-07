@@ -212,7 +212,9 @@ function readHandledKeys(): Set<string> {
           const receipt = JSON.parse(line) as { receipt_key?: unknown; status?: unknown };
           if (
             typeof receipt.receipt_key === "string" &&
-            (receipt.status === "delivered" || (uncertainIsHandled && receipt.status === "uncertain"))
+            (receipt.status === "delivered" ||
+              receipt.status === "queued" ||
+              (uncertainIsHandled && receipt.status === "uncertain"))
           ) {
             handled.add(receipt.receipt_key);
           }
@@ -403,7 +405,7 @@ function appendAppServerReceipt(
     project: envelope.relay_route.project,
     destination_thread_id: envelope.relay_route.destination_thread_id,
     ...result,
-    status: result.status === "delivered" ? "delivered" : "uncertain",
+    status: result.status,
     recorded_at: new Date().toISOString(),
   });
 }
@@ -474,7 +476,7 @@ async function triggerSlackMonitor(envelope: Record<string, unknown>): Promise<D
   return { status: "not_sent", detail };
 }
 
-async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delivered" | "pending" | "uncertain"> {
+async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delivered" | "queued" | "pending" | "uncertain"> {
   const renewTimer = setInterval(() => {
     void updateClaim("renew", envelope.dedup_key, envelope.claim_owner);
   }, CLAIM_RENEW_INTERVAL_MS);
@@ -490,7 +492,7 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
       acknowledgeEnvelope(envelope);
       await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
       log(
-        `relay-delivered key=${envelope.dedup_key} transport=codex_thread_queue project=${envelope.relay_route.project} thread=${appServerResult.threadId} submission=${appServerResult.queuedSubmissionId}`,
+        `relay-delivered key=${envelope.dedup_key} transport=codex_thread_queue project=${envelope.relay_route.project} thread=${appServerResult.threadId} submission=${appServerResult.queuedSubmissionId} start=accepted`,
       );
       process.stdout.write(
         `RELAY_DELIVERED ${JSON.stringify({
@@ -498,9 +500,27 @@ async function deliverClaimedEnvelope(envelope: RoutedEnvelope): Promise<"delive
           transport: "codex_thread_queue",
           thread_id: appServerResult.threadId,
           queued_submission_id: appServerResult.queuedSubmissionId,
+          start_accepted: true,
         })}\n`,
       );
       return "delivered";
+    }
+    if (appServerResult.status === "queued") {
+      appendAppServerReceipt(envelope, appServerResult);
+      acknowledgeEnvelope(envelope);
+      await updateClaim("release", envelope.dedup_key, envelope.claim_owner);
+      log(
+        `relay-queued-not-started key=${envelope.dedup_key} thread=${appServerResult.threadId} submission=${appServerResult.queuedSubmissionId} detail=${appServerResult.detail}`,
+      );
+      process.stdout.write(
+        `RELAY_QUEUED ${JSON.stringify({
+          key: envelope.dedup_key,
+          thread_id: appServerResult.threadId,
+          queued_submission_id: appServerResult.queuedSubmissionId,
+          detail: appServerResult.detail,
+        })}\n`,
+      );
+      return "queued";
     }
     if (appServerResult.status === "uncertain") {
       appendAppServerReceipt(envelope, appServerResult);
@@ -543,7 +563,9 @@ async function drainAppServer(): Promise<void> {
     const envelope = await runRelaySnapshot();
     if (!envelope) return;
     const status = await deliverClaimedEnvelope(envelope);
-    if (status !== "delivered") return;
+    // Queue acceptance is durable delivery even if this task is currently
+    // busy. Do not strand later envelopes waiting for another Slack event.
+    if (status !== "delivered" && status !== "queued") return;
   }
 }
 

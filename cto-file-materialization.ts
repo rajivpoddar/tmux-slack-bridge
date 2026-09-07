@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, statSync, lstatSync, unlinkSync, writeFileSync, linkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, lstatSync, unlinkSync, writeFileSync, linkSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 
 export type SlackFile = {
@@ -24,7 +24,7 @@ export type MaterializedAttachment = {
 
 export type SlackFilesClient = {
   files?: {
-    info?: (args: { file: string }) => Promise<unknown>;
+    info?: (args: { file: string; signal?: AbortSignal }) => Promise<unknown>;
   };
 };
 
@@ -46,7 +46,7 @@ const ALLOWED_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/web
 
 function safeReason(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
-  if (["unsafe-url", "redirect-limit", "oversize", "invalid-image-payload", "file-metadata-unavailable", "path-collision", "unsafe-image-root", "unsafe-image-directory", "missing-file-id"].includes(message)) return message;
+  if (["unsafe-url", "redirect-limit", "oversize", "invalid-image-payload", "file-metadata-unavailable", "path-collision", "unsafe-image-root", "unsafe-image-directory", "missing-file-id", "attachment-timeout"].includes(message)) return message;
   if (/^http-[0-9]{3}$/.test(message)) return message;
   return "download-failed";
 }
@@ -72,18 +72,20 @@ function eventDirectory(rootDir: string, eventKey: string): string {
   const path = join(rootDir, digest);
   if (existsSync(rootDir)) {
     const rootStat = lstatSync(rootDir);
-    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("unsafe-image-root");
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== process.getuid?.() || (rootStat.mode & 0o777) !== 0o700) throw new Error("unsafe-image-root");
   } else {
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
   }
-  chmodSync(rootDir, 0o700);
+  const rootMetadata = lstatSync(rootDir);
+  if (rootMetadata.uid !== process.getuid?.() || (rootMetadata.mode & 0o777) !== 0o700) throw new Error("unsafe-image-root");
   if (existsSync(path)) {
     const eventStat = lstatSync(path);
-    if (!eventStat.isDirectory() || eventStat.isSymbolicLink()) throw new Error("unsafe-image-directory");
+    if (!eventStat.isDirectory() || eventStat.isSymbolicLink() || eventStat.uid !== process.getuid?.() || (eventStat.mode & 0o777) !== 0o700) throw new Error("unsafe-image-directory");
   } else {
     mkdirSync(path, { mode: 0o700 });
   }
-  chmodSync(path, 0o700);
+  const eventMetadata = lstatSync(path);
+  if (eventMetadata.uid !== process.getuid?.() || (eventMetadata.mode & 0o777) !== 0o700) throw new Error("unsafe-image-directory");
   return path;
 }
 
@@ -101,34 +103,55 @@ function checkedUrl(raw: unknown): URL {
   return url;
 }
 
-async function fetchSlackBytes(url: URL, options: MaterializeOptions): Promise<Uint8Array> {
+async function readBoundedBody(response: Response, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
+  if (!response.body) throw new Error("invalid-image-payload");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new Error("attachment-timeout");
+      const next = await reader.read();
+      if (next.done) break;
+      const value = next.value;
+      if (total + value.byteLength > maxBytes) {
+        await reader.cancel("oversize");
+        throw new Error("oversize");
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
+async function fetchSlackBytes(url: URL, options: MaterializeOptions, signal: AbortSignal): Promise<Uint8Array> {
   const fetchImpl = options.fetchImpl || fetch;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   let current = url;
   for (let redirect = 0; redirect <= 1; redirect += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetchImpl(current, {
-        redirect: "manual",
-        headers: { Authorization: `Bearer ${options.token}` },
-        signal: controller.signal,
-      });
-      if (response.status >= 300 && response.status < 400) {
-        if (redirect === 1) throw new Error("redirect-limit");
-        current = checkedUrl(response.headers.get("location"));
-        continue;
-      }
-      if (!response.ok) throw new Error(`http-${response.status}`);
-      const length = Number(response.headers.get("content-length") || "0");
-      if (Number.isFinite(length) && length > maxBytes) throw new Error("oversize");
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength > maxBytes) throw new Error("oversize");
-      return bytes;
-    } finally {
-      clearTimeout(timer);
+    const response = await fetchImpl(current, {
+      redirect: "manual",
+      headers: { Authorization: `Bearer ${options.token}` },
+      signal,
+    });
+    if (response.status >= 300 && response.status < 400) {
+      if (redirect === 1) throw new Error("redirect-limit");
+      current = checkedUrl(response.headers.get("location"));
+      continue;
     }
+    if (!response.ok) throw new Error(`http-${response.status}`);
+    const length = Number(response.headers.get("content-length") || "0");
+    if (Number.isFinite(length) && length > maxBytes) throw new Error("oversize");
+    return readBoundedBody(response, maxBytes, signal);
   }
   throw new Error("redirect-limit");
 }
@@ -140,7 +163,14 @@ function validImagePayload(bytes: Uint8Array): boolean {
   return bytes.length >= 12 && new TextDecoder().decode(bytes.slice(0, 4)) === "RIFF" && new TextDecoder().decode(bytes.slice(8, 12)) === "WEBP";
 }
 
-function publishAtomically(path: string, bytes: Uint8Array): void {
+function verifyPublished(path: string, expectedDigest: string, expectedSize: number): void {
+  const metadata = lstatSync(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600 || metadata.size !== expectedSize) throw new Error("path-collision");
+  const actualDigest = createHash("sha256").update(readFileSync(path)).digest("hex");
+  if (actualDigest !== expectedDigest) throw new Error("path-collision");
+}
+
+function publishAtomically(path: string, bytes: Uint8Array, expectedDigest: string): void {
   const temporary = `${path}.part-${process.pid}-${randomUUID()}`;
   try {
     writeFileSync(temporary, bytes, { encoding: "binary", mode: 0o600, flag: "wx" });
@@ -155,19 +185,39 @@ function publishAtomically(path: string, bytes: Uint8Array): void {
   } catch (error) {
     try { unlinkSync(temporary); } catch { /* best effort cleanup */ }
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const existing = lstatSync(path);
-    if (!existing.isFile() || statSync(path).size !== bytes.byteLength) throw new Error("path-collision");
+    verifyPublished(path, expectedDigest, bytes.byteLength);
   }
+  verifyPublished(path, expectedDigest, bytes.byteLength);
 }
 
-async function resolveFile(file: SlackFile, client: SlackFilesClient): Promise<SlackFile> {
+async function resolveFile(file: SlackFile, client: SlackFilesClient, signal: AbortSignal): Promise<SlackFile> {
   if (!file.id || !client.files?.info) throw new Error("file-metadata-unavailable");
-  const result = await client.files.info({ file: file.id });
+  const result = await client.files.info({ file: file.id, signal });
   const remote = result && typeof result === "object" && "file" in result ? (result as { file?: unknown }).file : null;
   if (!result || typeof result !== "object" || (result as { ok?: unknown }).ok !== true || !remote || typeof remote !== "object") {
     throw new Error("file-metadata-unavailable");
   }
   return { ...file, ...(remote as SlackFile) };
+}
+
+async function runBoundedAttachmentOperation<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("attachment-timeout"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    controller.abort();
+  }
 }
 
 export async function materializeSlackImages(
@@ -207,19 +257,29 @@ export async function materializeSlackImages(
       results.push({ file_id: null, name, mimetype: originalMime, size: original.size ?? null, path: null, sha256: null, status: "unavailable", reason: "missing-file-id" });
       continue;
     }
-    let file: SlackFile;
     try {
-      file = await resolveFile(original, options.client);
+      const resolved = await runBoundedAttachmentOperation(
+        async (signal) => {
+          const file = await resolveFile(original, options.client, signal);
+          const mimetype = safeMime(file.mimetype);
+          if (!mimetype || !ALLOWED_MIME.has(mimetype)) return { file, bytes: null as Uint8Array | null };
+          const bytes = await fetchSlackBytes(checkedUrl(file.url_private_download || file.url_private), options, signal);
+          return { file, bytes };
+        },
+        options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      );
+      const file = resolved.file;
       const mimetype = safeMime(file.mimetype);
       if (!mimetype || !ALLOWED_MIME.has(mimetype)) {
         results.push({ file_id: fileId, name: safeName(file.name, index, mimetype), mimetype, size: file.size ?? null, path: null, sha256: null, status: "unsupported", reason: "unsupported-image-type" });
         continue;
       }
-      const bytes = await fetchSlackBytes(checkedUrl(file.url_private_download || file.url_private), options);
+      const bytes = resolved.bytes;
+      if (!bytes) throw new Error("invalid-image-payload");
       if (!validImagePayload(bytes)) throw new Error("invalid-image-payload");
       const digest = createHash("sha256").update(bytes).digest("hex");
       const finalPath = join(directory, `${String(index + 1).padStart(2, "0")}-${safeName(file.name, index, mimetype)}`);
-      publishAtomically(finalPath, bytes);
+      publishAtomically(finalPath, bytes, digest);
       results.push({ file_id: fileId, name: safeName(file.name, index, mimetype), mimetype, size: bytes.byteLength, path: finalPath, sha256: digest, status: "saved" });
     } catch (error) {
       results.push({ file_id: fileId, name, mimetype: originalMime, size: original.size ?? null, path: null, sha256: null, status: "unavailable", reason: safeReason(error) });

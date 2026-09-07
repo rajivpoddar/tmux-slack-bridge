@@ -67,6 +67,16 @@ describe("CTO Slack relay architecture", () => {
     expect(BRIDGE_SOURCE).not.toContain("verifyConsumerTerminal");
   });
 
+  test("treats accepted-but-not-started queue entries as delivered and drainable", () => {
+    expect(APP_SERVER_SOURCE).toContain('status: "queued"');
+    expect(BRIDGE_SOURCE).toContain('if (appServerResult.status === "queued")');
+    expect(BRIDGE_SOURCE).toContain("appendAppServerReceipt(envelope, appServerResult);");
+    expect(BRIDGE_SOURCE).toContain("acknowledgeEnvelope(envelope);");
+    expect(BRIDGE_SOURCE).toContain('receipt.status === "queued"');
+    expect(BRIDGE_SOURCE).toContain('status !== "delivered" && status !== "queued"');
+    expect(BRIDGE_SOURCE).not.toContain("triggerSlackMonitor(envelope);\n    return \"pending\";");
+  });
+
   test("puts the complete two-bucket route table in the monitor SOP", () => {
     const sop = readFileSync(ROUTER_SOP_PATH, "utf8");
     expect(sop).toContain("exact_tuple.channel == C09TYQC1DEF");

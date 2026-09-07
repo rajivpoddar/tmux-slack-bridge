@@ -64,6 +64,8 @@ describe("Codex app-server transport", () => {
               },
             },
           });
+        } else if (request.method === "thread/queue/start") {
+          current.send({ id: request.id, result: {} });
         }
       });
       return child as unknown as ChildProcessWithoutNullStreams;
@@ -81,8 +83,29 @@ describe("Codex app-server transport", () => {
       threadId: "destination-1",
       queuedSubmissionId: "submission-1",
       clientUserMessageId: stableClientUserMessageId("C1:1"),
+      startAccepted: true,
     });
-    expect(methods).toEqual(["initialize", "thread/queue/add"]);
+    expect(methods).toEqual(["initialize", "thread/queue/add", "thread/queue/start"]);
+    client.stop();
+  });
+
+  test("returns durable queued acceptance without fallback when queue/start is unavailable", async () => {
+    let child!: FakeChild;
+    const spawnChild: AppServerSpawnChild = (() => {
+      child = fakeChild((request, current) => {
+        if (request.method === "initialize") current.send({ id: request.id, result: {} });
+        if (request.method === "thread/queue/add") {
+          current.send({ id: request.id, result: { queuedSubmission: { id: "submission-queued", clientUserMessageId: stableClientUserMessageId("queued:1") } } });
+        }
+        if (request.method === "thread/queue/start") {
+          current.send({ id: request.id, error: { code: -32000, message: "thread-busy" } });
+        }
+      });
+      return child as unknown as ChildProcessWithoutNullStreams;
+    }) as unknown as AppServerSpawnChild;
+    const client = new CodexAppServerClient({ spawnChild });
+    const result = await client.deliver({ destinationThreadId: "destination-queued", routedWakeText: "queued wake", dedupKey: "queued:1" });
+    expect(result).toEqual({ status: "queued", detail: "app-server-thread-busy", threadId: "destination-queued", queuedSubmissionId: "submission-queued", clientUserMessageId: stableClientUserMessageId("queued:1") });
     client.stop();
   });
 

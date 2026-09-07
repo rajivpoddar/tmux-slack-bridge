@@ -21,6 +21,14 @@ export type AppServerDeliveryResult =
       threadId: string;
       queuedSubmissionId: string;
       clientUserMessageId: string;
+      startAccepted: true;
+    }
+  | {
+      status: "queued";
+      detail: string;
+      threadId: string;
+      queuedSubmissionId: string;
+      clientUserMessageId: string;
     }
   | { status: "unavailable"; detail: string }
   | {
@@ -75,6 +83,7 @@ export class CodexAppServerClient {
     const threadId = request.destinationThreadId;
     const clientUserMessageId = stableClientUserMessageId(request.dedupKey);
     let queueAddAttempted = false;
+    let queuedSubmissionId = "";
     try {
       await this.ensureStarted();
       queueAddAttempted = true;
@@ -84,15 +93,28 @@ export class CodexAppServerClient {
         clientUserMessageId,
       });
       const queuedSubmission = readNestedRecord(queueResponse.result, "queuedSubmission");
-      const queuedSubmissionId = readString(queuedSubmission, "id");
+      const returnedQueuedSubmissionId = readString(queuedSubmission, "id");
       const returnedClientUserMessageId = readString(queuedSubmission, "clientUserMessageId");
-      if (!queuedSubmissionId) throw new Error("thread-queue-add-response-missing-submission-id");
+      if (!returnedQueuedSubmissionId) {
+        throw new Error("thread-queue-add-response-missing-submission-id");
+      }
       if (returnedClientUserMessageId !== clientUserMessageId) {
         throw new Error("thread-queue-add-response-mismatched-client-message-id");
       }
-      return { status: "delivered", threadId, queuedSubmissionId, clientUserMessageId };
+      queuedSubmissionId = returnedQueuedSubmissionId;
+      await this.request("thread/queue/start", { threadId, queuedSubmissionId });
+      return {
+        status: "delivered",
+        threadId,
+        queuedSubmissionId,
+        clientUserMessageId,
+        startAccepted: true,
+      };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      if (queuedSubmissionId) {
+        return { status: "queued", detail, threadId, queuedSubmissionId, clientUserMessageId };
+      }
       if (error instanceof AppServerRpcError) return { status: "unavailable", detail };
       if (queueAddAttempted) {
         return { status: "uncertain", threadId, clientUserMessageId, detail };
