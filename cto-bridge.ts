@@ -22,8 +22,9 @@ import {
   type PreviousThreadMessage,
   type SlackThreadMessage,
 } from "./cto-thread-context.ts";
-import { formatCtoWakeMessage } from "./cto-wake-delivery.ts";
 import { ipcOwnerDiscoveryArgs } from "./cto-ipc-policy.ts";
+import { materializeSlackImages, type MaterializedAttachment, type SlackFile } from "./cto-file-materialization.ts";
+import { buildCtoDurableEnvelope, hasDurableEnvelopeKey } from "./cto-envelope-queue.ts";
 import {
   CodexAppServerClient,
   type AppServerDeliveryResult,
@@ -60,6 +61,7 @@ type SlackEvent = {
   text?: string;
   bot_id?: string;
   subtype?: string;
+  files?: SlackFile[];
 };
 
 type SlackEventBody = {
@@ -77,6 +79,14 @@ type EventTuple = {
   subtype: string | null;
   text: string;
 };
+
+function readQueuedKeys(key: string): Set<string> {
+  const keys = new Set<string>();
+  for (const path of [QUEUE_FILE, EVENTS_FILE]) {
+    if (hasDurableEnvelopeKey(path, key)) keys.add(key);
+  }
+  return keys;
+}
 
 function loadCtoEnvironment(): void {
   if (process.env.SLACK_CTO_BOT_TOKEN && process.env.SLACK_CTO_APP_TOKEN) return;
@@ -737,7 +747,7 @@ async function receiveEvent(
   const text = event.text ?? "";
   const key = `${channel}:${ts}`;
 
-  log(`event-receipt type=${eventType} key=${key || "invalid"} user=${user || "missing"}`);
+  log(`event-receipt type=${eventType} subtype=${event.subtype || "none"} key=${key || "invalid"} user=${user || "missing"}`);
 
   if (!channel || !ts || (!user && !botId)) {
     log(`event-ignored reason=missing-exact-tuple-field key=${key || "invalid"}`);
@@ -750,6 +760,12 @@ async function receiveEvent(
   if (readHandledKeys().has(key)) {
     remember(key);
     log(`event-ignored reason=durably-handled key=${key}`);
+    return;
+  }
+  if (readQueuedKeys(key).has(key)) {
+    remember(key);
+    log(`event-ignored reason=durably-queued key=${key}`);
+    requestAppServerDrain();
     return;
   }
   // Mark BEFORE any await: message.group + app_mention for the same message
@@ -773,6 +789,12 @@ async function receiveEvent(
     subtype: event.subtype ?? null,
     text,
   };
+  const attachments: MaterializedAttachment[] = event.files?.length
+    ? await materializeSlackImages(event.files, key, {
+        client: app.client,
+        token: botToken,
+      })
+    : [];
   const threadSnapshot = await fetchThreadSnapshot(tuple);
   const sourceEvidence = {
     transport: "slack_bolt_socket_mode",
@@ -781,24 +803,19 @@ async function receiveEvent(
     slack_event_time: body.event_time ?? null,
     team_id: body.team_id ?? null,
     channel_type: event.channel_type ?? null,
+    subtype: event.subtype ?? null,
   };
-  const durableEnvelope: Record<string, unknown> = {
-    queued_at: new Date().toISOString(),
-    delivery_status: "pending",
-    sop_path: SLACK_MONITOR_SOP,
-    fingerprint: `cto-slack-relay:slack_socket_mode:${key}`,
-    dedup_key: key,
-    source: "slack_socket_mode",
-    class: "CTO_SLACK_RELAY_EVENT",
-    exact_tuple: tuple,
-    source_evidence: sourceEvidence,
-    live_verification: threadSnapshot.verification,
-    previous_thread_message: threadSnapshot.previousThreadMessage,
-    closure_condition: "The frozen destination task accepts the exact routed wake",
-  };
-
+  let durableEnvelope: Record<string, unknown>;
   try {
-    durableEnvelope.wake_text = formatCtoWakeMessage(durableEnvelope);
+    durableEnvelope = buildCtoDurableEnvelope({
+      key,
+      tuple,
+      sourceEvidence,
+      verification: threadSnapshot.verification,
+      previousThreadMessage: threadSnapshot.previousThreadMessage,
+      attachments,
+      sopPath: SLACK_MONITOR_SOP,
+    });
   } catch (error) {
     log(`wake-format-failure key=${key} error=${formatError(error)}`);
     return;
