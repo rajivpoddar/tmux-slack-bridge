@@ -40,10 +40,23 @@ function blockHasCtoMention(block: unknown, quoted = false): boolean {
   if (!block || typeof block !== "object") return false;
   const record = block as Record<string, unknown>;
   const type = typeof record.type === "string" ? record.type : "";
-  if (quoted || type === "rich_text_quote" || type === "blockquote") return false;
+  const style = record.style && typeof record.style === "object"
+    ? record.style as Record<string, unknown>
+    : null;
+  if (
+    quoted ||
+    type === "rich_text_quote" ||
+    type === "blockquote" ||
+    type === "rich_text_preformatted" ||
+    style?.code === true
+  ) return false;
   if (type === "user" && record.user_id === CTO_USER_ID) return true;
-  if (typeof record.text === "string" && renderedTextHasCtoMention(record.text)) return true;
   if (record.text && typeof record.text === "object" && blockHasCtoMention(record.text, false)) return true;
+  // Only Slack's rendered mrkdwn surface can carry mention markup. Plain
+  // rich-text/text elements are literal content and must not authorize ingress.
+  if (type === "mrkdwn" && typeof record.text === "string" && renderedTextHasCtoMention(record.text)) {
+    return true;
+  }
   if (Array.isArray(record.elements)) {
     return record.elements.some((element) => blockHasCtoMention(element, false));
   }
@@ -63,8 +76,8 @@ export function slackIngressEventType(
   event: SlackIngressCandidate,
   source: "message" | "app_mention",
 ): SlackIngressEventType | null {
-  if (source === "app_mention") return "app_mention";
   if (event.channel === HEYDONNA_DEV_CHANNEL_ID && !hasExplicitCtoMention(event)) return null;
+  if (source === "app_mention") return "app_mention";
   if (event.channel === SUPERPROOFER_CHANNEL_ID) return "message.group";
   if (event.channel_type === "im") return "message.im";
   // Every otherwise-unmatched message visible to the CTO app enters the

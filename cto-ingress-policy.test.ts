@@ -64,6 +64,24 @@ describe("CTO Slack ingress subscription policy", () => {
     ).toBeNull();
   });
 
+  test("applies the current-message gate to app_mention source events", () => {
+    expect(slackIngressEventType(dev({ text: "ordinary reply" }), "app_mention")).toBeNull();
+    expect(slackIngressEventType(dev({ text: "> <@U0BNFGX2UAX> quoted" }), "app_mention")).toBeNull();
+    expect(slackIngressEventType(dev({ text: "<@U0BNFGX2UAX> current" }), "app_mention")).toBe(
+      "app_mention",
+    );
+  });
+
+  test("does not treat preformatted or code-styled literal blocks as mentions", () => {
+    for (const blocks of [
+      [{ type: "rich_text", elements: [{ type: "rich_text_preformatted", elements: [{ type: "text", text: "<@U0BNFGX2UAX>" }] }] }],
+      [{ type: "section", text: { type: "mrkdwn", text: "<@U0BNFGX2UAX>", style: { code: true } } }],
+      [{ type: "rich_text", elements: [{ type: "rich_text_section", elements: [{ type: "text", text: "<@U0BNFGX2UAX>" }] }] }],
+    ]) {
+      expect(slackIngressEventType(dev({ blocks }), "message")).toBeNull();
+    }
+  });
+
   test("ignores thread replies without a current CTO mention", () => {
     expect(slackIngressEventType(dev({ thread_ts: "1788844489.947899", text: "follow-up" }), "message")).toBeNull();
   });
