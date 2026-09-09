@@ -128,6 +128,9 @@ describe("CTO Slack ingress subscription policy", () => {
       ),
     ).toBe("message.channel");
     expect(slackIngressEventType(alertsBot({ text: "plain alert" }), "app_mention")).toBe("app_mention");
+    expect(slackIngressEventType(alertsBot({ user: undefined, text: "bot_message without user field" }), "message")).toBe(
+      "message.channel",
+    );
   });
 
   test("requires the verified sender identity, not display text or a spoofed bot id", () => {
