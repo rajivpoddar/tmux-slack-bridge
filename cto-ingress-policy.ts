@@ -22,6 +22,19 @@ export type SlackIngressEventType =
 const CTO_USER_ID = "U0BNFGX2UAX";
 const CTO_MENTION = new RegExp(`<@${CTO_USER_ID}(?:\\|[^>\\r\\n]*)?>`);
 
+// Workflow notifications are emitted by the dedicated HeyDonna CI bot. They
+// are the only unmentioned messages allowed through #heydonna-dev: ordinary
+// bot chatter still needs a current CTO mention. Keep these shapes tied to the
+// existing notifier templates so a keyword in arbitrary text cannot wake the
+// CTO Decisions task.
+const WORKFLOW_TERMINAL_PREFIXES = [
+  /^:white_check_mark:\s+\*CI \+ E2E\* success on `[^`\r\n]+`/,
+  /^:white_check_mark:\s+\*E2E passed\* on `[^`\r\n]+`/,
+  /^:x:\s+\*(?:CI|E2E Smoke Tests) failed\* on `[^`\r\n]+`/,
+  /^:(?:white_check_mark|x):\s+\*E2E Capture\* (?:success|failure) \([^\r\n]+\) on `[^`\r\n]+`/,
+];
+const WORKFLOW_RUN_ANCHOR = /(?:actions\/runs\/\d+|\brun\s+\d+\b)/;
+
 function renderedTextHasCtoMention(text: string): boolean {
   // Slack block quotes and code spans are rendered context, not a current
   // author mention. Ignore them so quoted history or pasted examples cannot
@@ -68,6 +81,55 @@ function hasExplicitCtoMention(event: SlackIngressCandidate): boolean {
   return Array.isArray(event.blocks) && event.blocks.some((block) => blockHasCtoMention(block));
 }
 
+function collectRenderedBlockText(value: unknown, quoted = false): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  const style = record.style && typeof record.style === "object"
+    ? record.style as Record<string, unknown>
+    : null;
+  if (
+    quoted ||
+    type === "rich_text_quote" ||
+    type === "blockquote" ||
+    type === "rich_text_preformatted" ||
+    style?.code === true
+  ) return [];
+
+  const texts: string[] = [];
+  if ((type === "mrkdwn" || type === "plain_text" || type === "text") && typeof record.text === "string") {
+    texts.push(record.text);
+  }
+  if (Array.isArray(record.elements)) {
+    const childText = record.elements.flatMap((element) => collectRenderedBlockText(element));
+    if (childText.length > 0) texts.push(childText.join(""));
+  }
+  if (record.text && typeof record.text === "object") {
+    const nestedText = collectRenderedBlockText(record.text);
+    if (nestedText.length > 0) texts.push(nestedText.join(""));
+  }
+  return texts;
+}
+
+function hasWorkflowTerminalShape(event: SlackIngressCandidate): boolean {
+  const texts = [
+    ...(typeof event.text === "string" ? [event.text] : []),
+    ...(Array.isArray(event.blocks) ? event.blocks.flatMap((block) => collectRenderedBlockText(block)) : []),
+  ];
+  return texts.some((text) =>
+    WORKFLOW_TERMINAL_PREFIXES.some((prefix) => prefix.test(text) && WORKFLOW_RUN_ANCHOR.test(text)),
+  );
+}
+
+function isTrustedWorkflowTerminal(event: SlackIngressCandidate): boolean {
+  return (
+    event.channel === HEYDONNA_DEV_CHANNEL_ID &&
+    event.bot_id === HEYDONNA_CI_BOT_ID &&
+    (!event.user || event.user === HEYDONNA_CI_BOT_USER_ID) &&
+    hasWorkflowTerminalShape(event)
+  );
+}
+
 /**
  * Decide only whether the Socket Mode event belongs in the durable relay.
  * This is subscription policy, not final task routing.
@@ -76,7 +138,11 @@ export function slackIngressEventType(
   event: SlackIngressCandidate,
   source: "message" | "app_mention",
 ): SlackIngressEventType | null {
-  if (event.channel === HEYDONNA_DEV_CHANNEL_ID && !hasExplicitCtoMention(event)) return null;
+  if (
+    event.channel === HEYDONNA_DEV_CHANNEL_ID &&
+    !isTrustedWorkflowTerminal(event) &&
+    !hasExplicitCtoMention(event)
+  ) return null;
   if (source === "app_mention") return "app_mention";
   if (event.channel === SUPERPROOFER_CHANNEL_ID) return "message.group";
   if (event.channel_type === "im") return "message.im";

@@ -14,6 +14,16 @@ const dev = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+const workflowBot = (overrides: Record<string, unknown> = {}) =>
+  dev({
+    user: HEYDONNA_CI_BOT_USER_ID,
+    bot_id: HEYDONNA_CI_BOT_ID,
+    subtype: "bot_message",
+    ...overrides,
+  });
+
+const runLink = " — <https://github.com/heydonna-app/heydonna-app/actions/runs/12345|View run>";
+
 describe("CTO Slack ingress subscription policy", () => {
   test("admits human and bot messages with an explicit current CTO mention", () => {
     expect(slackIngressEventType(dev({ text: "<@U0BNFGX2UAX> please inspect" }), "message")).toBe(
@@ -98,5 +108,83 @@ describe("CTO Slack ingress subscription policy", () => {
 
   test("keeps malformed events rejected", () => {
     expect(slackIngressEventType({}, "message")).toBeNull();
+  });
+
+  test("admits only the existing trusted workflow terminal templates", () => {
+    const terminals = [
+      `:white_check_mark: *CI + E2E* success on \`main\`${runLink}`,
+      `:x: *CI failed* on \`fix/example\`${runLink}`,
+      `:x: *E2E Smoke Tests failed* on \`fix/example\`${runLink}`,
+      `:white_check_mark: *E2E Capture* success (full) on \`fix/example\`${runLink}`,
+      `:x: *E2E Capture* failure (full) on \`fix/example\`${runLink}`,
+    ];
+    for (const text of terminals) {
+      expect(slackIngressEventType(workflowBot({ text }), "message")).toBe("message.channel");
+      expect(slackIngressEventType(workflowBot({ text }), "app_mention")).toBe("app_mention");
+    }
+    expect(
+      slackIngressEventType(
+        workflowBot({ user: undefined, text: terminals[1] }),
+        "message",
+      ),
+    ).toBe("message.channel");
+  });
+
+  test("recognizes a rendered workflow terminal block", () => {
+    expect(
+      slackIngressEventType(
+        workflowBot({
+          text: "",
+          blocks: [{ type: "section", text: { type: "mrkdwn", text: `:x: *CI failed* on \`main\`${runLink}` } }],
+        }),
+        "message",
+      ),
+    ).toBe("message.channel");
+    expect(
+      slackIngressEventType(
+        workflowBot({
+          text: "",
+          blocks: [{
+            type: "rich_text",
+            elements: [{
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: ":x: *E2E Smoke Tests failed* on `main`" },
+                { type: "text", text: runLink },
+              ],
+            }],
+          }],
+        }),
+        "message",
+      ),
+    ).toBe("message.channel");
+  });
+
+  test("does not make ordinary, forged, quoted, or code-only bot text eligible", () => {
+    const ordinary = [
+      "CI failed — inspect this later",
+      `> :x: *CI failed* on \`main\`${runLink}`,
+      `\`:x: *CI failed* on \`main\`${runLink}\``,
+    ];
+    for (const text of ordinary) {
+      expect(slackIngressEventType(workflowBot({ text }), "message")).toBeNull();
+    }
+    expect(
+      slackIngressEventType(
+        dev({ user: "U_HUMAN", bot_id: HEYDONNA_CI_BOT_ID, text: `:x: *CI failed* on \`main\`${runLink}` }),
+        "message",
+      ),
+    ).toBeNull();
+    expect(
+      slackIngressEventType(
+        dev({ user: HEYDONNA_CI_BOT_USER_ID, bot_id: "B_FORGED", text: `:x: *CI failed* on \`main\`${runLink}` }),
+        "message",
+      ),
+    ).toBeNull();
+  });
+
+  test("requires the complete terminal shape, not a status keyword alone", () => {
+    expect(slackIngressEventType(workflowBot({ text: ":x: *CI failed* on `main`" }), "message")).toBeNull();
+    expect(slackIngressEventType(workflowBot({ text: `:white_check_mark: *CI + E2E* success on \`main\`${runLink.replace("12345", "")}` }), "message")).toBeNull();
   });
 });
