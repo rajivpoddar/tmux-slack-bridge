@@ -1,9 +1,12 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  HEYDONNA_ALERTS_WEBHOOK_BOT_ID,
   HEYDONNA_CI_BOT_ID,
   HEYDONNA_CI_BOT_USER_ID,
+  HEYDONNA_DEV_ALERTS_WEBHOOK_BOT_ID,
   HEYDONNA_DEV_CHANNEL_ID,
+  isTrustedSlackAlert,
   slackIngressEventType,
 } from "./cto-ingress-policy.ts";
 
@@ -149,6 +152,79 @@ describe("CTO Slack ingress subscription policy", () => {
     expect(
       slackIngressEventType(
         dev({ user: "U_HUMAN", username: "Slack Alerts", text: "CI passed" }),
+        "message",
+      ),
+    ).toBeNull();
+  });
+
+  // Live shape of a HeyDonna Alerts incoming-webhook post (e.g. C0AEY9CEC4D
+  // ts 1790400553.328709 "Editor readonly lockout"): subtype bot_message,
+  // webhook bot_id, no user field. Each webhook has its own bot_id: the old
+  // #heydonna-alerts webhook B0AHQ6BK7F1 and the new #heydonna-dev webhook
+  // B0C4LE7DLUW (both app A0AHQ6WMKF1, bots.info user_id null).
+  const webhookAlert = (
+    overrides: Record<string, unknown> = {},
+    botId: string = HEYDONNA_ALERTS_WEBHOOK_BOT_ID,
+  ) => {
+    const event: Record<string, unknown> = dev({
+      bot_id: botId,
+      subtype: "bot_message",
+      text: ":red_circle: *Editor readonly lockout*",
+      ...overrides,
+    });
+    if (!("user" in overrides)) delete event.user;
+    return event;
+  };
+
+  for (const [label, botId] of [
+    ["old alerts webhook", HEYDONNA_ALERTS_WEBHOOK_BOT_ID],
+    ["new dev webhook", HEYDONNA_DEV_ALERTS_WEBHOOK_BOT_ID],
+  ] as const) {
+    test(`admits ${label} (${botId}) posts on #heydonna-dev without a CTO mention`, () => {
+      expect(isTrustedSlackAlert(webhookAlert({}, botId))).toBe(true);
+      expect(slackIngressEventType(webhookAlert({}, botId), "message")).toBe("message.channel");
+      expect(
+        slackIngressEventType(
+          webhookAlert({
+            text: "",
+            blocks: [{ type: "section", text: { type: "mrkdwn", text: "Critical failure" } }],
+          }, botId),
+          "message",
+        ),
+      ).toBe("message.channel");
+    });
+
+    test(`rejects ${label} (${botId}) when a user field is present`, () => {
+      for (const user of ["U_HUMAN", HEYDONNA_CI_BOT_USER_ID, "U0BNFGX2UAX"]) {
+        expect(isTrustedSlackAlert(webhookAlert({ user }, botId))).toBe(false);
+        expect(slackIngressEventType(webhookAlert({ user }, botId), "message")).toBeNull();
+      }
+    });
+
+    test(`scopes ${label} (${botId}) trust to #heydonna-dev only`, () => {
+      for (const channel of ["C0AEY9CEC4D", "C_OTHER", "D_SOMEDM"]) {
+        expect(isTrustedSlackAlert(webhookAlert({ channel }, botId))).toBe(false);
+      }
+    });
+  }
+
+  test("keeps the CI bot tuple unchanged and does not cross-bind users", () => {
+    expect(isTrustedSlackAlert(alertsBot())).toBe(true);
+    expect(isTrustedSlackAlert(alertsBot({ user: undefined }))).toBe(true);
+    expect(isTrustedSlackAlert(alertsBot({ user: "U_HUMAN" }))).toBe(false);
+    expect(isTrustedSlackAlert(alertsBot({ channel: "C_OTHER" }))).toBe(false);
+  });
+
+  test("an unrelated bot on #heydonna-dev without a CTO mention is dropped", () => {
+    expect(
+      slackIngressEventType(
+        webhookAlert({ bot_id: "B_UNRELATED", text: "HeyDonna Alerts: Editor readonly lockout" }),
+        "message",
+      ),
+    ).toBeNull();
+    expect(
+      slackIngressEventType(
+        webhookAlert({ bot_id: "B_UNRELATED", username: "HeyDonna Alerts" }),
         "message",
       ),
     ).toBeNull();

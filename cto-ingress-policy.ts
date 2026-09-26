@@ -2,6 +2,14 @@ export const SUPERPROOFER_CHANNEL_ID = "C09TYQC1DEF";
 export const HEYDONNA_DEV_CHANNEL_ID = "C0ALZJHGE49";
 export const HEYDONNA_CI_BOT_USER_ID = "U0AJZTN7SM6";
 export const HEYDONNA_CI_BOT_ID = "B0AJ3HSC2PQ";
+// HeyDonna Alerts app (A0AHQ6WMKF1) incoming-webhook bots. Slack registers a
+// distinct bot_id per webhook. Both resolve to no bot user (bots.info user_id
+// is null) and webhook posts carry no `user` field.
+// Old #heydonna-alerts webhook: keep only for the cutover overlap window;
+// retire with the #heydonna-alerts cleanup follow-up.
+export const HEYDONNA_ALERTS_WEBHOOK_BOT_ID = "B0AHQ6BK7F1";
+// New #heydonna-dev webhook (bot_add C0ALZJHGE49 ts 1790406849.574359).
+export const HEYDONNA_DEV_ALERTS_WEBHOOK_BOT_ID = "B0C4LE7DLUW";
 
 export type SlackIngressCandidate = {
   channel?: string;
@@ -69,14 +77,23 @@ function hasExplicitCtoMention(event: SlackIngressCandidate): boolean {
   return Array.isArray(event.blocks) && event.blocks.some((block) => blockHasCtoMention(block));
 }
 
-// Slack alerts are emitted by one immutable bot identity. The bot_id is the
+// Slack alerts are emitted by fixed immutable sender tuples. The bot_id is the
 // authoritative sender field; user is optional on bot_message events but, when
-// present, must agree. No message text or display name participates in routing.
-function isTrustedSlackAlert(event: SlackIngressCandidate): boolean {
-  return (
-    event.channel === HEYDONNA_DEV_CHANNEL_ID &&
-    event.bot_id === HEYDONNA_CI_BOT_ID &&
-    (!event.user || event.user === HEYDONNA_CI_BOT_USER_ID)
+// present, must agree with the user that bot resolves to. Webhook bots resolve
+// to no user, so any user field on them is a mismatch. No message text or
+// display name participates in routing.
+const TRUSTED_ALERT_SENDERS: ReadonlyArray<{ botId: string; userId: string | null }> = [
+  { botId: HEYDONNA_CI_BOT_ID, userId: HEYDONNA_CI_BOT_USER_ID },
+  { botId: HEYDONNA_ALERTS_WEBHOOK_BOT_ID, userId: null },
+  { botId: HEYDONNA_DEV_ALERTS_WEBHOOK_BOT_ID, userId: null },
+];
+
+export function isTrustedSlackAlert(event: SlackIngressCandidate): boolean {
+  if (event.channel !== HEYDONNA_DEV_CHANNEL_ID) return false;
+  return TRUSTED_ALERT_SENDERS.some(
+    (sender) =>
+      event.bot_id === sender.botId &&
+      (!event.user || event.user === sender.userId),
   );
 }
 
