@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 
-const DEFAULT_COMMAND = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const DEFAULT_COMMAND = "/opt/homebrew/bin/codex";
 const DEFAULT_ARGS = ["app-server", "--stdio"];
 const START_ATTEMPTS = 2;
 const REQUEST_TIMEOUT_MS = 20_000;

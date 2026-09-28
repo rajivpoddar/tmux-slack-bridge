@@ -56,7 +56,7 @@ describe("CTO Slack relay architecture", () => {
     expect(APP_SERVER_SOURCE).not.toContain('this.request("thread/start"');
     expect(APP_SERVER_SOURCE).not.toContain("ephemeral: true");
     expect(APP_SERVER_SOURCE).toContain("stableClientUserMessageId");
-    expect(APP_SERVER_SOURCE).toContain("/Applications/ChatGPT.app/Contents/Resources/codex");
+    expect(APP_SERVER_SOURCE).toContain("/opt/homebrew/bin/codex");
     expect(APP_SERVER_SOURCE).not.toContain("waitForCompletion");
     expect(APP_SERVER_SOURCE).not.toContain("turn/completed");
     expect(BRIDGE_SOURCE).toContain('updateClaim("renew"');
