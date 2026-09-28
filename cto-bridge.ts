@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { eventOriginIgnoreReason } from "./cto-event-policy.ts";
 import {
+  hasExplicitCtoMention,
   slackIngressEventType,
   type SlackIngressEventType,
 } from "./cto-ingress-policy.ts";
@@ -59,6 +60,7 @@ type SlackEvent = {
   thread_ts?: string;
   user?: string;
   text?: string;
+  blocks?: unknown[];
   bot_id?: string;
   subtype?: string;
   files?: SlackFile[];
@@ -826,6 +828,8 @@ async function receiveEvent(
     team_id: body.team_id ?? null,
     channel_type: event.channel_type ?? null,
     subtype: event.subtype ?? null,
+    explicit_cto_mention:
+      event.channel === "C0ALZJHGE49" ? hasExplicitCtoMention(event) : null,
   };
   let durableEnvelope: Record<string, unknown>;
   try {

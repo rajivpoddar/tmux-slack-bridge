@@ -55,6 +55,18 @@ describe("CTO Slack ingress subscription policy", () => {
     }
   });
 
+  test("does not admit unmentioned CI or webhook alerts, but admits a current CTO mention", () => {
+    for (const event of [
+      dev({ user: HEYDONNA_CI_BOT_USER_ID, bot_id: HEYDONNA_CI_BOT_ID, subtype: "bot_message", text: "CI failed" }),
+      dev({ user: undefined, bot_id: "B_ALERTS_WEBHOOK", subtype: "bot_message", text: "Build failed" }),
+    ]) {
+      expect(slackIngressEventType(event, "message")).toBeNull();
+      expect(slackIngressEventType({ ...event, text: "<@U0BNFGX2UAX> please triage" }, "message")).toBe(
+        "message.channel",
+      );
+    }
+  });
+
   test("ignores a CTO mention that exists only in a quoted block", () => {
     expect(
       slackIngressEventType(

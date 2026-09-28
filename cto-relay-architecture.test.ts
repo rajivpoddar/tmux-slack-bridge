@@ -12,8 +12,8 @@ import { afterEach, describe, expect, test } from "vitest";
 
 const BRIDGE_SOURCE = readFileSync(new URL("./cto-bridge.ts", import.meta.url), "utf8");
 const APP_SERVER_SOURCE = readFileSync(new URL("./codex-app-server-client.ts", import.meta.url), "utf8");
-const ROUTER_SOP_PATH = "/Users/rajiv/.codex/monitors/cto-slack-relay/WAKE_SOP.md";
-const SNAPSHOT_HELPER = "/Users/rajiv/.claude/scripts/cto-relay-snapshot.py";
+const ROUTER_SOP_PATH = new URL("./monitors/cto-slack-relay/WAKE_SOP.md", import.meta.url).pathname;
+const SNAPSHOT_HELPER = new URL("./scripts/cto-relay-snapshot.py", import.meta.url).pathname;
 const AUTOMATION_PATH =
   "/Users/rajiv/.codex/automations/heydonna-cto-slack-relay-backup/automation.toml";
 const temporaryDirectories: string[] = [];
@@ -40,6 +40,12 @@ describe("CTO Slack relay architecture", () => {
     );
     expect(BRIDGE_SOURCE).not.toContain("acknowledgeWake(");
     expect(BRIDGE_SOURCE).toContain("MONITOR_TRIGGER_RECEIPTS_FILE");
+  });
+
+  test("persists current-message mention proof for queued-event relay validation", () => {
+    expect(BRIDGE_SOURCE).toContain("explicit_cto_mention:");
+    expect(BRIDGE_SOURCE).toContain("hasExplicitCtoMention(event)");
+    expect(BRIDGE_SOURCE).toContain('event.channel === "C0ALZJHGE49"');
   });
 
   test("uses the supported app-server queue without creating or resuming a task", () => {
@@ -84,7 +90,7 @@ describe("CTO Slack relay architecture", () => {
     expect(sop).toContain("every qualifying bridge event is HeyDonna");
     expect(sop).toContain("codex_app__send_message_to_thread");
     expect(sop).toContain("Do not post to Slack from the router");
-    expect(sop).toContain("<!-- CTO_SLACK_ROUTE_TABLE_V1");
+    expect(sop).toContain("<!-- CTO_SLACK_ROUTE_TABLE_V2");
     expect(sop).toContain("CTO_SLACK_ROUTE_TABLE_END -->");
   });
 
@@ -120,8 +126,9 @@ describe("CTO Slack relay architecture", () => {
             dedup_key: "C1:1",
             fingerprint: "relay:C1:1",
             sop_path: ROUTER_SOP_PATH,
-            exact_tuple: { channel: "C0ALZJHGE49", ts: "1", text: "one" },
-            wake_text: `SOP path: ${ROUTER_SOP_PATH}\n\none`,
+            exact_tuple: { channel: "C0ALZJHGE49", ts: "1", text: "<@U0BNFGX2UAX> one" },
+            source_evidence: { explicit_cto_mention: true },
+            wake_text: `SOP path: ${ROUTER_SOP_PATH}\n\n<@U0BNFGX2UAX> one`,
           },
           {
             dedup_key: "C2:2",

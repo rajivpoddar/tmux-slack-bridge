@@ -63,7 +63,7 @@ function blockHasCtoMention(block: unknown, quoted = false): boolean {
   return false;
 }
 
-function hasExplicitCtoMention(event: SlackIngressCandidate): boolean {
+export function hasExplicitCtoMention(event: SlackIngressCandidate): boolean {
   if (typeof event.text === "string" && renderedTextHasCtoMention(event.text)) return true;
   return Array.isArray(event.blocks) && event.blocks.some((block) => blockHasCtoMention(block));
 }
@@ -76,6 +76,8 @@ export function slackIngressEventType(
   event: SlackIngressCandidate,
   source: "message" | "app_mention",
 ): SlackIngressEventType | null {
+  // #heydonna-dev is CTO Decisions mention-only. Verified CI/webhook sender
+  // identity does not grant an exception; the current message must mention CTO.
   if (event.channel === HEYDONNA_DEV_CHANNEL_ID && !hasExplicitCtoMention(event)) return null;
   if (source === "app_mention") return "app_mention";
   if (event.channel === SUPERPROOFER_CHANNEL_ID) return "message.group";
